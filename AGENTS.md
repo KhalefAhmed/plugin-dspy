@@ -1,15 +1,15 @@
-# Kestra Template Plugin
+# Kestra DSPy Plugin
 
 ## What
 
-- Provides plugin components under `io.kestra.plugin.templates`.
-- Includes classes such as `Example`, `Trigger`.
+- Provides plugin components under `io.kestra.plugin.dspy`.
+- Provides `Predict` and `Optimize` tasks.
 
 ## Why
 
-- What user problem does this solve? Teams need a concrete starting point for building and validating new Kestra plugins without recreating the same project scaffolding from scratch.
-- Why would a team adopt this plugin in a workflow? It gives plugin authors a ready-made reference repo they can adapt alongside their own build, test, and publishing workflow.
-- What operational/business outcome does it enable? It shortens plugin delivery time, reduces setup mistakes, and makes internal or partner plugin development more repeatable.
+- Execute and optimize DSPy programs without a hard-coded business use case.
+- Users can provide a declarative signature or a trusted Python module factory.
+- Datasets use generic `inputs` and optional `reference` objects, not RAG-specific fields.
 
 ## How
 
@@ -17,7 +17,7 @@
 
 Single-module plugin. Source packages under `io.kestra.plugin`:
 
-- `templates`
+- `dspy`
 
 Infrastructure dependencies (Docker Compose services):
 
@@ -25,14 +25,17 @@ Infrastructure dependencies (Docker Compose services):
 
 ### Key Plugin Classes
 
-- `io.kestra.plugin.templates.Example`
+- `io.kestra.plugin.dspy.Predict`
+- `io.kestra.plugin.dspy.Optimize`
+- `AbstractDspy` reuses Kestra's `AbstractExecScript` and TaskRunner APIs.
+- Python execution is implemented in `src/main/resources/scripts/dspy_task.py`.
 
 ### Project Structure
 
 ```
-plugin-template/
-├── src/main/java/io/kestra/plugin/templates/
-├── src/test/java/io/kestra/plugin/templates/
+plugin-dspy/
+├── src/main/java/io/kestra/plugin/dspy/
+├── src/test/java/io/kestra/plugin/dspy/
 ├── build.gradle
 └── README.md
 ```
@@ -40,6 +43,9 @@ plugin-template/
 ## Local rules
 
 - Base the wording on the implemented packages and classes, not on template README text.
+- Keep tasks generic: domain-specific fields belong in user signatures or programs.
+- Runtime image dependencies are locked in `python/requirements.lock`.
+- Build the runtime image, then use `DSPY_DOCKER_TESTS=true ./gradlew test lintPluginDocs shadowJar` for integration checks.
 
 ## References
 

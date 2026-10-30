@@ -21,7 +21,7 @@ repositories {
     }
 }
 
-final targetJavaVersion = JavaVersion.VERSION_21
+final targetJavaVersion = JavaVersion.VERSION_25
 
 java {
     sourceCompatibility = targetJavaVersion
@@ -29,7 +29,7 @@ java {
 }
 
 group = "io.kestra.plugin"
-description = 'Plugin template for Kestra'
+description = 'DSPy integration for Kestra'
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = "UTF-8"
@@ -57,6 +57,7 @@ dependencies {
  **********************************************************************************************************************/
 test {
     useJUnitPlatform()
+    inputs.property("dspyDockerTests", System.getenv("DSPY_DOCKER_TESTS") ?: "false")
 }
 
 dependencies {
@@ -121,7 +122,7 @@ mavenPublishing {
     pom {
         name = "${project.name}"
         description = "${project.group}:${project.name}:${project.version}"
-        url = "https://github.com/kestra-io/${project.name}"
+        url = "https://github.com/KhalefAhmed/${project.name}"
         licenses {
             license {
                 name = 'The Apache License, Version 2.0'
@@ -130,14 +131,14 @@ mavenPublishing {
         }
         developers {
             developer {
-                id = 'tchiotludo'
-                name = 'Dehon'
-                email = 'ldehon@kestra.io'
+                id = 'KhalefAhmed'
+                name = 'KHALEF'
+                email = 'khalef.ahmedkhalil@gmail.com'
             }
         }
         scm {
             connection = 'scm:git:'
-            url = "https://github.com/kestra-io/${project.name}"
+            url = "https://github.com/KhalefAhmed/${project.name}"
         }
     }
 }
@@ -151,8 +152,8 @@ jar {
     manifest {
         attributes(
             "X-Kestra-Name": project.name,
-            "X-Kestra-Title": "Template",
-            "X-Kestra-Group": project.group + ".templates",
+            "X-Kestra-Title": "DSPy",
+            "X-Kestra-Group": project.group + ".dspy",
             "X-Kestra-Description": project.description,
             "X-Kestra-Version": project.version
         )

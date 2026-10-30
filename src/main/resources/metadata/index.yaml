@@ -1,8 +1,8 @@
-group: io.kestra.plugin.templates
-name: "template"
-title: "Template"
-description: "Plugin template for Kestra"
+group: io.kestra.plugin.dspy
+name: "dspy"
+title: "DSPy"
+description: "Optimize and run declarative or custom DSPy programs with generic datasets, explicit models and versioned artifacts."
 body: ""
 videos: []
-createdBy: "Kestra Core Team"
-managedBy: "Kestra Core Team"
+createdBy: "KhalefAhmed"
+managedBy: "KhalefAhmed"
