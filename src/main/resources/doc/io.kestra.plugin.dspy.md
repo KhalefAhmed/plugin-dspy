@@ -40,6 +40,30 @@ and references as fields on the DSPy example.
 Predictions contain `schemaVersion`, `id`, `inputs`, `outputs` and `artifactVersion`.
 No field named `question`, `contexts` or `answer` is imposed.
 
+## Runner file paths
+
+Source files are supplied through `datasetUri`, `trainsetUri`, `validationUri`,
+`programUri` and `artifactUri`. Java loads and validates datasets, then passes their
+records and the runner paths through a stored configuration file. Dataset strings
+are preserved as data, not rendered as templates. Python does not read JSONL datasets
+or assume any dataset or artifact filename.
+
+Use `filePaths` to override paths within the runner's working directory:
+
+```yaml
+filePaths:
+  train: inputs/examples.jsonl
+  validation: inputs/held-out.jsonl
+  program: modules/my-program.py
+  candidate: artifacts/compiled.json
+  result: reports/evaluation.json
+```
+
+`Optimize` supports the roles shown above. `Predict` supports `program`, `dataset`,
+`artifact`, `predictions` and `summary`. Omitted paths retain the existing defaults.
+Paths must be distinct relative file paths, without glob patterns or traversal
+outside the working directory. Output URI properties remain unchanged.
+
 ## Runtime and credentials
 
 Build the default runtime image with:
