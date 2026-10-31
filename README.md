@@ -240,7 +240,7 @@ validated in the target infrastructure. The embedded launcher currently targets
 Linux/POSIX execution.
 
 Files named `dspy_task.py`, `dspy_config.json`, `user_program.py`, `artifact.json`,
-`dataset.jsonl`, `train.jsonl` and `validation.jsonl` are reserved task inputs.
+`examples/dataset.jsonl`, `train.jsonl` and `validation.jsonl` are reserved task inputs.
 
 ## Checks
 

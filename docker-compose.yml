@@ -4,12 +4,20 @@ services:
       context: .
       dockerfile: Dockerfile
     command: server local
+    group_add:
+      - "${DOCKER_GID:-102}"
+    environment:
+      - SECRET_OPENAI_API_KEY
     ports:
       - "8080:8080"
     volumes:
+      - kestra-data:/app/data
       - ./build/libs/:/app/plugins/
       - /var/run/docker.sock:/var/run/docker.sock
     # works around "Unable to create JFR repository directory using base
     # location (/tmp)" on some hosts, see kestra-io/kestra#17405
     tmpfs:
-      - /tmp
+      - /tmp:exec
+
+volumes:
+  kestra-data:

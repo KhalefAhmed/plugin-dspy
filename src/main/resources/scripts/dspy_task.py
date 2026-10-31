@@ -73,7 +73,9 @@ def digest(path):
 
 
 def write_json(path, value):
-    Path(path).write_bytes(canonical(value) + b"\n")
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(canonical(value) + b"\n")
 
 
 def text(value, field):
@@ -85,38 +87,6 @@ def text(value, field):
 def versioned(value, location):
     if not isinstance(value, dict) or type(value.get("schemaVersion")) is not int or value["schemaVersion"] != SCHEMA_VERSION:
         raise ContractError(f"{location} requires schemaVersion: {SCHEMA_VERSION}")
-
-
-def read_dataset(path, supervised):
-    records = []
-    ids = set()
-    with Path(path).open(encoding="utf-8") as source:
-        for line_number, line in enumerate(source, 1):
-            location = f"{Path(path).name}:{line_number}"
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as error:
-                raise ContractError(f"Invalid JSON at {location}") from error
-            versioned(record, location)
-            identifier = text(record.get("id"), f"{location} id")
-            if identifier in ids:
-                raise ContractError(f"Duplicate id at {location}")
-            ids.add(identifier)
-            inputs = record.get("inputs")
-            if not isinstance(inputs, dict):
-                raise ContractError(f"{location} requires an inputs object")
-            reference = record.get("reference", {})
-            if not isinstance(reference, dict) or (supervised and not reference):
-                raise ContractError(f"{location} requires a non-empty reference object")
-            if set(inputs) & set(reference):
-                raise ContractError(f"{location} input and reference fields must be disjoint")
-            if any(not key.isidentifier() or key.startswith("_") for key in inputs | reference):
-                raise ContractError(f"{location} field names must be public Python identifiers")
-            canonical(record)
-            records.append(record)
-    if not records:
-        raise ContractError(f"{Path(path).name} must not be empty")
-    return records
 
 
 def normalized(value):
@@ -140,43 +110,26 @@ def examples(records):
     ]
 
 
-def load_user_module():
-    if not Path("user_program.py").is_file():
+def load_user_module(path):
+    if path is None:
         return None
-    spec = importlib.util.spec_from_file_location("user_program", "user_program.py")
+    spec = importlib.util.spec_from_file_location("user_program", path)
+    if spec is None or spec.loader is None:
+        raise ContractError("The configured program path must point to a Python module")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-def program_descriptor(config):
-    if config.get("signature") is not None:
-        if Path("user_program.py").is_file():
-            raise ContractError("Provide either signature or programUri, not both")
-        return {
-            "kind": "declarative",
-            "signature": text(config["signature"], "signature"),
-            "predictor": config["predictor"],
-            "instructions": config.get("instructions"),
-        }
-    if not Path("user_program.py").is_file():
-        raise ContractError("Provide signature or programUri")
-    return {
-        "kind": "python",
-        "factory": text(config["programFactory"], "programFactory"),
-        "sha256": digest("user_program.py"),
-    }
-
-
-def build_program(descriptor, module):
+def build_program(descriptor, module) -> dspy.Module:
     if descriptor.get("kind") == "declarative":
         if module is not None:
             raise ContractError("A declarative artifact cannot be combined with programUri")
         return DeclarativeProgram(descriptor)
     if descriptor.get("kind") != "python":
         raise ContractError("Unknown program kind")
-    if module is None or descriptor.get("sha256") != digest("user_program.py"):
+    if module is None or descriptor.get("sha256") != digest(module.__file__):
         raise ContractError("The custom artifact requires its original programUri (source hash mismatch)")
     factory = getattr(module, descriptor["factory"], None)
     if not callable(factory):
@@ -187,21 +140,18 @@ def build_program(descriptor, module):
     return program
 
 
-def make_metric(config, module, records):
+def make_metric(config, module):
     name = config.get("metricFunction")
     if name:
         custom = getattr(module, name, None) if module is not None else None
         if not callable(custom):
             raise ContractError("metricFunction must name a callable in programUri")
     else:
-        reference_fields = {frozenset(row["reference"]) for row in records}
-        if len(reference_fields) != 1:
-            raise ContractError("All reference objects must use the same output fields")
-        fields = next(iter(reference_fields))
+        fields = set(config["referenceFields"])
 
-        def custom(example, prediction, trace=None):
+        def custom(example, prediction, _trace=None):
             outputs = prediction_outputs(prediction)
-            if not fields <= outputs.keys():
+            if fields.difference(outputs):
                 raise ContractError("The program did not return all reference fields")
             return all(normalized(example[field]) == normalized(outputs[field]) for field in fields)
 
@@ -215,6 +165,10 @@ def make_metric(config, module, records):
 
 
 def validate_fields(records, descriptor):
+    for row in records:
+        fields = row["inputs"] | row.get("reference", {})
+        if any(not key.isidentifier() or key.startswith("_") for key in fields):
+            raise ContractError("Dataset field names must be public Python identifiers")
     if descriptor["kind"] != "declarative":
         return
     signature = dspy.Signature(descriptor["signature"])
@@ -246,7 +200,7 @@ def artifact_version(artifact):
     return hashlib.sha256(canonical({key: value for key, value in artifact.items() if key != "artifactVersion"})).hexdigest()
 
 
-def make_artifact(program, descriptor, model):
+def make_artifact(program: dspy.Module, descriptor, model):
     program.set_lm(None)
     artifact = {
         "schemaVersion": SCHEMA_VERSION,
@@ -271,17 +225,14 @@ def validate_state(state):
 
 
 def optimize(config):
-    if config.get("optimizer") != "BOOTSTRAP_FEW_SHOT":
-        raise ContractError("Unsupported optimizer")
-    supervised = not config.get("metricFunction")
-    train = read_dataset("train.jsonl", supervised=supervised)
-    validation = read_dataset("validation.jsonl", supervised=supervised)
-    if {row["id"] for row in train} & {row["id"] for row in validation}:
-        raise ContractError("Training and validation IDs must be disjoint")
-    descriptor = program_descriptor(config)
+    files = config["files"]
+    train = config["datasets"]["train"]
+    validation = config["datasets"]["validation"]
+    descriptor = config["program"]
     validate_fields(train + validation, descriptor)
-    module = load_user_module()
-    metric = make_metric(config, module, train + validation)
+    module = load_user_module(files.get("program"))
+    metric = make_metric(config, module)
+    # Reproducible training order only; this RNG does not generate secrets or tokens.
     random.seed(config["seed"])
     random.shuffle(train)
     student_lm = make_lm(config["studentModel"], "STUDENT", config)
@@ -308,45 +259,26 @@ def optimize(config):
         ]
     artifact = make_artifact(candidate, descriptor, config["studentModel"])
     validate_state(artifact["state"])
-    manifest = {
-        "schemaVersion": SCHEMA_VERSION,
-        "artifactVersion": artifact["artifactVersion"],
-        "artifactSha256": hashlib.sha256(canonical(artifact) + b"\n").hexdigest(),
-        "program": descriptor,
+    result = {
         "pythonVersion": platform.python_version(),
         "dspyVersion": DSPY_VERSION,
-        "studentModel": config["studentModel"],
-        "teacherModel": config["teacherModel"],
-        "optimizer": config["optimizer"],
-        "seed": config["seed"],
-        "maxBootstrappedDemos": config["maxBootstrappedDemos"],
-        "maxLabeledDemos": config["maxLabeledDemos"],
-        "metricThreshold": config["metricThreshold"],
-        "maxLlmCalls": config["maxLlmCalls"],
-        "maxTokens": config["maxTokens"],
-        "requestTimeoutSeconds": config["requestTimeoutSeconds"],
         "dependencyVersions": {
             name: importlib.metadata.version(name)
             for name in ("dspy", "litellm", "pydantic", "openai")
         },
-        "train": {"sha256": digest("train.jsonl"), "count": len(train)},
-        "validation": {
-            "sha256": digest("validation.jsonl"),
-            "count": len(validation),
-            "metric": config.get("metricFunction") or "normalized_exact_match_v1",
-            "score": sum(scores) / len(scores),
-        },
+        "validationScore": sum(scores) / len(scores),
         "modelCalls": dict(BudgetLM.budget.counts),
     }
-    write_json("candidate.json", artifact)
-    write_json("manifest.json", manifest)
+    write_json(files["candidate"], artifact)
+    write_json(files["result"], result)
 
 
 def predict(config):
-    records = read_dataset("dataset.jsonl", supervised=False)
-    module = load_user_module()
-    if Path("artifact.json").is_file():
-        artifact = json.loads(Path("artifact.json").read_text(encoding="utf-8"))
+    files = config["files"]
+    records = config["datasets"]["dataset"]
+    module = load_user_module(files.get("program"))
+    if files.get("artifact") is not None:
+        artifact = json.loads(Path(files["artifact"]).read_text(encoding="utf-8"))
         versioned(artifact, "artifact")
         if artifact.get("dspyVersion") != DSPY_VERSION:
             raise ContractError("Incompatible DSPy version")
@@ -358,7 +290,7 @@ def predict(config):
         program.load_state(artifact["state"])
         model = text(config.get("model", artifact.get("studentModel")), "Student model")
     else:
-        descriptor = program_descriptor(config)
+        descriptor = config["program"]
         program = build_program(descriptor, module)
         model = text(config.get("model"), "Student model")
         artifact = make_artifact(program, descriptor, model)
@@ -366,7 +298,9 @@ def predict(config):
     lm = make_lm(model, "STUDENT", config)
     program.set_lm(lm)
     started = time.monotonic()
-    partial = Path("predictions.partial")
+    target_path = Path(files["predictions"])
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    partial = target_path.with_name(target_path.name + ".partial")
     with dspy.context(lm=lm), partial.open("wb") as target:
         for row in records:
             prediction = program(**row["inputs"])
@@ -377,8 +311,8 @@ def predict(config):
                 "outputs": prediction_outputs(prediction),
                 "artifactVersion": artifact["artifactVersion"],
             }) + b"\n")
-    partial.replace("predictions.jsonl")
-    write_json("prediction-summary.json", {
+    partial.replace(target_path)
+    write_json(files["summary"], {
         "schemaVersion": SCHEMA_VERSION,
         "artifactVersion": artifact["artifactVersion"],
         "model": model,
@@ -388,7 +322,7 @@ def predict(config):
     })
 
 
-def report_error(error_type, error, traceback):
+def report_error(error_type, error, _traceback):
     if isinstance(error, (ContractError, BudgetExceeded)):
         print(f"{error_type.__name__}: {error}", file=sys.stderr)
     else:
@@ -399,10 +333,6 @@ def main(path):
     if importlib.metadata.version("dspy") != DSPY_VERSION:
         raise ContractError(f"This plugin requires dspy=={DSPY_VERSION}")
     config = json.loads(Path(path).read_text(encoding="utf-8"))
-    versioned(config, "configuration")
-    for field in ("maxLlmCalls", "requestTimeoutSeconds", "maxTokens"):
-        if type(config.get(field)) is not int or config[field] <= 0:
-            raise ContractError(f"{field} must be a positive integer")
     BudgetLM.budget = Budget(config["maxLlmCalls"])
     dspy.configure(adapter=dspy.ChatAdapter(use_json_adapter_fallback=False), disable_history=True)
     logging.getLogger("dspy").setLevel(logging.ERROR)
@@ -410,14 +340,6 @@ def main(path):
         logging.getLogger(name).disabled = True
     operation = config.get("operation")
     if operation == "optimize":
-        for field in ("maxBootstrappedDemos", "maxLabeledDemos"):
-            if type(config.get(field)) is not int or config[field] <= 0:
-                raise ContractError(f"{field} must be a positive integer")
-        if type(config.get("seed")) is not int:
-            raise ContractError("seed must be an integer")
-        threshold = config.get("metricThreshold")
-        if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not math.isfinite(threshold) or not 0 < threshold <= 1:
-            raise ContractError("metricThreshold must be in (0, 1]")
         optimize(config)
     elif operation == "predict":
         predict(config)

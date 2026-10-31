@@ -37,6 +37,20 @@ class DspyDockerTest {
 
     @Test
     void optimizeThenPredictWithStoredFilesAndExplicitTeacher() throws Exception {
+        roundTrip(Map.of(), Map.of());
+    }
+
+    @Test
+    void optimizeThenPredictWithConfiguredNestedPaths() throws Exception {
+        roundTrip(
+            Map.of("train", "inputs/examples.jsonl", "validation", "inputs/held out.jsonl",
+                "candidate", "compiled/program.json", "result", "reports/evaluation.json"),
+            Map.of("dataset", "requests/batch.jsonl", "artifact", "saved/program.json",
+                "predictions", "answers/predictions.jsonl", "summary", "reports/summary.json")
+        );
+    }
+
+    private void roundTrip(Map<String, String> optimizePaths, Map<String, String> predictPaths) throws Exception {
         List<String> models = new CopyOnWriteArrayList<>();
         HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);
         server.createContext("/v1/chat/completions", exchange -> {
@@ -73,6 +87,7 @@ class DspyDockerTest {
                 .maxLabeledDemos(Property.ofValue(1))
                 .trainsetUri(Property.ofExpression("{{ inputs.train }}"))
                 .validationUri(Property.ofExpression("{{ inputs.validation }}"))
+                .filePaths(Property.ofValue(optimizePaths))
                 .env(env)
                 .build();
             RunContext uploadContext = TestsUtils.mockRunContext(runContextFactory, optimize, Map.of());
@@ -84,6 +99,16 @@ class DspyDockerTest {
             try (var input = optimizeContext.storage().getFile(candidate.getManifestUri())) {
                 var manifest = JacksonMapper.ofJson().readTree(input);
                 assertEquals(1.0, manifest.get("validation").get("score").asDouble());
+                assertEquals("normalized_exact_match_v1", manifest.get("validation").get("metric").asText());
+                assertEquals(1, manifest.get("train").get("count").asInt());
+                try (var artifact = optimizeContext.storage().getFile(candidate.getCandidateArtifactUri())) {
+                    Path file = directory.resolve("candidate.json");
+                    Files.copy(artifact, file);
+                    assertEquals(DspyDataset.digest(file), manifest.get("artifactSha256").asText());
+                    var state = JacksonMapper.ofJson().readTree(file.toFile());
+                    assertEquals(state.get("artifactVersion"), manifest.get("artifactVersion"));
+                    assertEquals(state.get("program"), manifest.get("program"));
+                }
             }
 
             var dataset = upload(uploadContext, "dataset", row("test", false));
@@ -93,6 +118,7 @@ class DspyDockerTest {
                 .taskRunner(runner())
                 .artifactUri(Property.ofValue(candidate.getCandidateArtifactUri().toString()))
                 .datasetUri(Property.ofValue(dataset))
+                .filePaths(Property.ofValue(predictPaths))
                 .env(env)
                 .build();
             RunContext predictContext = TestsUtils.mockRunContext(runContextFactory, predict, Map.of());
@@ -101,6 +127,7 @@ class DspyDockerTest {
                 var prediction = JacksonMapper.ofJson().readTree(input);
                 assertEquals("billing", prediction.get("outputs").get("category").asText());
                 assertEquals("test", prediction.get("id").asText());
+                assertEquals("Send my invoice. {{ untouched }}", prediction.get("inputs").get("text").asText());
                 assertTrue(prediction.hasNonNull("artifactVersion"));
             }
             assertEquals(List.of("teacher", "student", "student"), models);
@@ -139,7 +166,7 @@ class DspyDockerTest {
     }
 
     private String row(String id, boolean supervised) {
-        return "{\"schemaVersion\":1,\"id\":\"" + id + "\",\"inputs\":{\"text\":\"Send my invoice.\"}"
+        return "{\"schemaVersion\":1,\"id\":\"" + id + "\",\"inputs\":{\"text\":\"Send my invoice. {{ untouched }}\"}"
             + (supervised ? ",\"reference\":{\"category\":\"billing\"}" : "") + "}\n";
     }
 }

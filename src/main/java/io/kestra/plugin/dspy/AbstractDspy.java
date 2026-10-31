@@ -3,11 +3,14 @@ package io.kestra.plugin.dspy;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
+import io.kestra.core.exceptions.IllegalVariableEvaluationException;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.property.URIFetcher;
 import io.kestra.core.runners.FilesService;
@@ -56,6 +59,14 @@ public abstract class AbstractDspy extends AbstractExecScript {
     protected Property<String> programFactory = Property.ofValue("build_program");
 
     @Schema(
+        title = "Runner file paths",
+        description = "Overrides relative working-directory paths by role. Predict supports program, dataset, artifact, predictions and summary. Optimize supports program, train, validation, candidate and result. Paths may include subdirectories and must be distinct, without glob patterns or traversal outside the working directory. Source URIs remain configured with the task's URI properties."
+    )
+    @Builder.Default
+    @NotNull
+    protected Property<Map<String, String>> filePaths = Property.ofValue(Map.of());
+
+    @Schema(
         title = "Image containing Python and DSPy",
         description = "Build `plugin-dspy:3.4.1` with `docker build -f python/Dockerfile -t plugin-dspy:3.4.1 .`, or override with your own compatible image."
     )
@@ -86,7 +97,7 @@ public abstract class AbstractDspy extends AbstractExecScript {
     @NotNull
     protected Property<Integer> maxTokens = Property.ofValue(1024);
 
-    protected Map<String, Object> configuration(RunContext runContext) throws Exception {
+    protected Map<String, Object> configuration(RunContext runContext) throws IllegalVariableEvaluationException {
         Map<String, Object> configuration = new LinkedHashMap<>();
         configuration.put("schemaVersion", 1);
         configuration.put("maxLlmCalls", positive(runContext, maxLlmCalls, "maxLlmCalls"));
@@ -99,18 +110,52 @@ public abstract class AbstractDspy extends AbstractExecScript {
         return configuration;
     }
 
-    protected Map<String, String> programFiles(RunContext context) throws Exception {
+    protected Map<String, String> programFiles(RunContext context, Map<String, String> paths) throws IllegalVariableEvaluationException {
         Map<String, String> files = new LinkedHashMap<>();
         if (context.render(programUri).as(String.class).isPresent()) {
             if (context.render(signature).as(String.class).isPresent() || context.render(instructions).as(String.class).isPresent()) {
                 throw new IllegalArgumentException("programUri cannot be combined with signature or instructions");
             }
-            files.put("user_program.py", uri(context, programUri, "programUri"));
+            files.put("program", uri(context, programUri, "programUri"));
+        } else {
+            paths.remove("program");
         }
         return files;
     }
 
-    protected int positive(RunContext context, Property<Integer> property, String name) throws Exception {
+    protected Map<String, String> filePaths(RunContext context, Map<String, String> defaults) throws IllegalVariableEvaluationException {
+        Map<String, String> paths = new LinkedHashMap<>(defaults);
+        Map<String, String> overrides = context.render(filePaths).asMap(String.class, String.class);
+        for (var entry : overrides.entrySet()) {
+            if (!defaults.containsKey(entry.getKey())) {
+                throw new IllegalArgumentException("Unsupported filePaths role: " + entry.getKey());
+            }
+            paths.put(entry.getKey(), entry.getValue());
+        }
+        paths.replaceAll(AbstractDspy::runnerPath);
+        if (new HashSet<>(paths.values()).size() != paths.size()) {
+            throw new IllegalArgumentException("filePaths must use distinct paths");
+        }
+        return paths;
+    }
+
+    private static String runnerPath(String role, String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("filePaths." + role + " must not be blank");
+        }
+        Path path = Path.of(value).normalize();
+        if (path.isAbsolute() || path.startsWith("..") || path.toString().isEmpty()
+            || value.chars().anyMatch(character -> "\\*?[]{}".indexOf(character) >= 0)) {
+            throw new IllegalArgumentException("filePaths." + role + " must be a relative file path without glob patterns");
+        }
+        String name = path.toString();
+        if (name.equals("dspy_task.py") || name.equals("dspy_config.json")) {
+            throw new IllegalArgumentException("Reserved runner filename: " + name);
+        }
+        return name;
+    }
+
+    protected int positive(RunContext context, Property<Integer> property, String name) throws IllegalVariableEvaluationException {
         int value = context.render(property).as(Integer.class).orElseThrow(() -> new IllegalArgumentException(name + " is required"));
         if (value <= 0) {
             throw new IllegalArgumentException(name + " must be positive");
@@ -118,7 +163,7 @@ public abstract class AbstractDspy extends AbstractExecScript {
         return value;
     }
 
-    protected String required(RunContext context, Property<String> property, String name) throws Exception {
+    protected String required(RunContext context, Property<String> property, String name) throws IllegalVariableEvaluationException {
         String value = context.render(property).as(String.class).orElseThrow(() -> new IllegalArgumentException(name + " is required"));
         if (value.isBlank()) {
             throw new IllegalArgumentException(name + " must not be blank");
@@ -126,20 +171,27 @@ public abstract class AbstractDspy extends AbstractExecScript {
         return value;
     }
 
-    protected String uri(RunContext context, Property<String> property, String name) throws Exception {
+    protected String uri(RunContext context, Property<String> property, String name) throws IllegalVariableEvaluationException {
         String value = required(context, property, name);
         URIFetcher.of(value);
         return value;
     }
 
-    protected ScriptOutput execute(RunContext context, Map<String, Object> configuration, Map<String, String> datasets, List<String> outputs) throws Exception {
+    protected ScriptOutput execute(RunContext context, Map<String, Object> configuration, Map<String, String> datasets, Map<String, String> paths, List<String> outputs) throws Exception {
         var commands = commands(context);
         Map<String, String> inputs = new LinkedHashMap<>(
             FilesService.inputFiles(context, commands.getTaskRunner().additionalVars(context, commands), getInputFiles())
         );
-        Map<String, String> internal = new LinkedHashMap<>(datasets);
-        internal.put("dspy_task.py", resource("/scripts/dspy_task.py"));
-        internal.put("dspy_config.json", JacksonMapper.ofJson().writeValueAsString(configuration));
+        for (String reserved : paths.values()) {
+            if (inputs.containsKey(reserved)) {
+                throw new IllegalArgumentException("Reserved input filename: " + reserved);
+            }
+        }
+        configuration.put("files", paths);
+        Map<String, String> internal = DspyInputs.prepare(context, configuration, datasets, paths);
+        internal.put("dspy_task.py", resource());
+        var configFile = context.workingDir().createTempFile(JacksonMapper.ofJson().writeValueAsBytes(configuration));
+        internal.put("dspy_config.json", context.storage().putFile(configFile.toFile()).toString());
         for (var entry : internal.entrySet()) {
             if (inputs.putIfAbsent(entry.getKey(), entry.getValue()) != null) {
                 throw new IllegalArgumentException("Reserved input filename: " + entry.getKey());
@@ -179,10 +231,10 @@ public abstract class AbstractDspy extends AbstractExecScript {
         return uri;
     }
 
-    private String resource(String name) throws IOException {
-        try (var stream = getClass().getResourceAsStream(name)) {
+    private String resource() throws IOException {
+        try (var stream = getClass().getResourceAsStream("/scripts/dspy_task.py")) {
             if (stream == null) {
-                throw new IOException("Missing embedded resource: " + name);
+                throw new IOException("Missing embedded resource: " + "/scripts/dspy_task.py");
             }
             return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
         }

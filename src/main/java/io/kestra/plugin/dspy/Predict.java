@@ -61,21 +61,33 @@ public class Predict extends AbstractDspy implements RunnableTask<Predict.Output
     public Output run(RunContext runContext) throws Exception {
         Map<String, Object> config = configuration(runContext);
         config.put("operation", "predict");
-        runContext.render(model).as(String.class).ifPresent(value -> config.put("model", value));
-        Map<String, String> files = programFiles(runContext);
-        files.put("dataset.jsonl", uri(runContext, datasetUri, "datasetUri"));
+        if (runContext.render(model).as(String.class).isPresent()) {
+            config.put("model", required(runContext, model, "model"));
+        }
+        Map<String, String> paths = filePaths(runContext, Map.of(
+            "program", "user_program.py", "dataset", "dataset.jsonl", "artifact", "artifact.json",
+            "predictions", "predictions.jsonl", "summary", "prediction-summary.json"
+        ));
+        Map<String, String> files = programFiles(runContext, paths);
+        files.put("dataset", uri(runContext, datasetUri, "datasetUri"));
         if (runContext.render(artifactUri).as(String.class).isPresent()) {
             if (config.containsKey("signature") || config.containsKey("instructions")) {
                 throw new IllegalArgumentException("An artifact already defines its signature and instructions");
             }
-            files.put("artifact.json", uri(runContext, artifactUri, "artifactUri"));
-        } else if (!config.containsKey("signature") && !files.containsKey("user_program.py")) {
+            files.put("artifact", uri(runContext, artifactUri, "artifactUri"));
+        } else {
+            paths.remove("artifact");
+        }
+        if (!files.containsKey("artifact") && !config.containsKey("signature") && !files.containsKey("program")) {
             throw new IllegalArgumentException("Provide artifactUri, signature or programUri");
         }
-        var result = execute(runContext, config, files, List.of("predictions.jsonl", "prediction-summary.json"));
+        if (!files.containsKey("artifact") && !config.containsKey("model")) {
+            throw new IllegalArgumentException("model is required for direct prediction");
+        }
+        var result = execute(runContext, config, files, paths, List.of(paths.get("predictions"), paths.get("summary")));
         return Output.builder()
-            .predictionsUri(outputUri(result, "predictions.jsonl"))
-            .summaryUri(outputUri(result, "prediction-summary.json"))
+            .predictionsUri(outputUri(result, paths.get("predictions")))
+            .summaryUri(outputUri(result, paths.get("summary")))
             .build();
     }
 

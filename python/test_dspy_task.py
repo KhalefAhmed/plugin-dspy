@@ -87,6 +87,7 @@ def record(identifier="one", reference=True):
 
 
 def dataset(path, records):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row) + "\n" for row in records), encoding="utf-8")
 
 
@@ -130,6 +131,39 @@ class DspyTaskTest(unittest.TestCase):
         }
 
     def run_task(self, directory, config):
+        config = dict(config)
+        files = {
+            "program": "user_program.py", "train": "train.jsonl", "validation": "validation.jsonl",
+            "dataset": "dataset.jsonl", "artifact": "artifact.json", "candidate": "candidate.json",
+            "result": "optimization-result.json", "predictions": "predictions.jsonl", "summary": "prediction-summary.json",
+            **config.get("files", {}),
+        }
+        if not (directory / files["program"]).is_file():
+            files.pop("program")
+        if not (directory / files["artifact"]).is_file():
+            files.pop("artifact")
+            if config.get("signature") is not None:
+                config["program"] = {
+                    "kind": "declarative",
+                    "signature": config["signature"],
+                    "predictor": config["predictor"],
+                    "instructions": config.get("instructions"),
+                }
+            else:
+                config["program"] = {
+                    "kind": "python",
+                    "factory": config["programFactory"],
+                    "sha256": task.digest(directory / files["program"]),
+                }
+        config["files"] = files
+        if "datasets" not in config:
+            roles = ("train", "validation") if config["operation"] == "optimize" else ("dataset",)
+            config["datasets"] = {}
+            for role in roles:
+                with (directory / files[role]).open(encoding="utf-8") as source:
+                    config["datasets"][role] = [json.loads(line) for line in source]
+        if config["operation"] == "optimize" and not config.get("metricFunction"):
+            config["referenceFields"] = list(config["datasets"]["train"][0]["reference"])
         task.write_json(directory / "config.json", config)
         endpoint = f"http://127.0.0.1:{self.server.server_port}/v1"
         environment = {
@@ -154,10 +188,9 @@ class DspyTaskTest(unittest.TestCase):
         result = self.run_task(self.directory, self.config("optimize"))
         self.assertEqual(result.returncode, 0, result.stderr)
         artifact = json.loads((self.directory / "candidate.json").read_text())
-        manifest = json.loads((self.directory / "manifest.json").read_text())
+        result_data = json.loads((self.directory / "optimization-result.json").read_text())
         self.assertEqual(FakeLLM.models, ["teacher", "student"])
-        self.assertEqual(manifest["validation"]["score"], 1)
-        self.assertEqual(manifest["artifactSha256"], task.digest(self.directory / "candidate.json"))
+        self.assertEqual(result_data["validationScore"], 1)
         self.assertIsNone(artifact["state"]["predictor"]["lm"])
         self.assertNotIn("test-student-secret", json.dumps(artifact))
         self.assertNotIn("test-teacher-secret", json.dumps(artifact))
@@ -179,32 +212,7 @@ class DspyTaskTest(unittest.TestCase):
             self.assertEqual(prediction["artifactVersion"], artifact["artifactVersion"])
             self.assertEqual(FakeLLM.models, ["teacher", "student", "student"])
 
-    def test_rejects_invalid_datasets_before_model_calls(self):
-        cases = [
-            [],
-            [record(), record()],
-            [{**record(), "inputs": []}],
-            [{key: value for key, value in record().items() if key != "reference"}],
-            [{**record(), "schemaVersion": True}],
-            [{**record(), "inputs": {"category": "overlaps with reference"}}],
-        ]
-        for rows in cases:
-            with self.subTest(rows=rows):
-                path = self.directory / "invalid.jsonl"
-                dataset(path, rows)
-                with self.assertRaises(ValueError):
-                    task.read_dataset(path, supervised=True)
-        self.assertEqual(FakeLLM.models, [])
-
-    def test_overlap_and_budget_fail_without_publishing_artifacts(self):
-        self.prepare_optimization()
-        dataset(self.directory / "validation.jsonl", [record("train")])
-        result = self.run_task(self.directory, self.config("optimize"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("disjoint", result.stderr)
-        self.assertEqual(FakeLLM.models, [])
-        self.assertFalse((self.directory / "candidate.json").exists())
-
+    def test_budget_fails_without_publishing_artifacts(self):
         self.prepare_optimization()
         result = self.run_task(self.directory, self.config("optimize", maxLlmCalls=1))
         self.assertNotEqual(result.returncode, 0)
@@ -226,9 +234,34 @@ class DspyTaskTest(unittest.TestCase):
         self.assertIn("integrity", result.stderr)
         self.assertEqual(FakeLLM.models, before)
         self.assertFalse((self.directory / "predictions.jsonl").exists())
-        metric = task.make_metric({}, None, [record()])
+        metric = task.make_metric({"referenceFields": ["category"]}, None)
+        example = task.dspy.Example(category=ANSWER)
+        prediction = task.dspy.Prediction(other="")
         with self.assertRaisesRegex(ValueError, "reference fields"):
-            metric(task.dspy.Example(category=ANSWER), task.dspy.Prediction(other=""))
+            metric(example, prediction)
+
+    def test_default_metric_allows_extra_outputs_and_rejects_missing_fields(self):
+        metric = task.make_metric({"referenceFields": ["category", "confidence"]}, None)
+        example = task.dspy.Example(category=ANSWER, confidence=0.9)
+        prediction = task.dspy.Prediction(category=ANSWER, confidence=0.9, reasoning="Explanation")
+        self.assertEqual(metric(example, prediction), 1.0)
+        incomplete = task.dspy.Prediction(category=ANSWER, reasoning="Explanation")
+        with self.assertRaisesRegex(ValueError, "reference fields"):
+            metric(example, incomplete)
+
+    def test_custom_metric_receives_bootstrap_trace(self):
+        from types import SimpleNamespace
+
+        seen = []
+
+        def score(example, prediction, trace):
+            seen.append(trace)
+            return 0.75
+
+        metric = task.make_metric({"metricFunction": "score"}, SimpleNamespace(score=score))
+        trace = [("predictor", {"source": "bonjour"}, {"translation": "hello"})]
+        self.assertEqual(metric(None, None, trace), 0.75)
+        self.assertIs(seen[0], trace)
 
     def test_direct_prediction_and_chain_of_thought(self):
         dataset(self.directory / "dataset.jsonl", [record("test", reference=False)])
@@ -245,6 +278,16 @@ class DspyTaskTest(unittest.TestCase):
                 prediction = json.loads((self.directory / "predictions.jsonl").read_text())
                 self.assertEqual(prediction["outputs"], expected)
 
+    def test_predict_uses_prepared_records_without_reading_dataset_files(self):
+        row = record("prepared", reference=False)
+        row["inputs"]["text"] = "{{ this must remain literal }}"
+        config = self.config("predict", model="openai/student", datasets={"dataset": [row]})
+        result = self.run_task(self.directory, config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prediction = json.loads((self.directory / "predictions.jsonl").read_text())
+        self.assertEqual(prediction["inputs"], row["inputs"])
+        self.assertFalse((self.directory / "dataset.jsonl").exists())
+
     def test_custom_program_metric_and_source_hash(self):
         (self.directory / "user_program.py").write_text(CUSTOM_PROGRAM)
         for path, identifier in (("train.jsonl", "train"), ("validation.jsonl", "validation")):
@@ -255,9 +298,10 @@ class DspyTaskTest(unittest.TestCase):
         config.pop("signature")
         result = self.run_task(self.directory, config)
         self.assertEqual(result.returncode, 0, result.stderr)
-        manifest = json.loads((self.directory / "manifest.json").read_text())
-        self.assertEqual(manifest["validation"]["score"], 0.75)
-        self.assertEqual(manifest["program"]["kind"], "python")
+        result_data = json.loads((self.directory / "optimization-result.json").read_text())
+        artifact = json.loads((self.directory / "candidate.json").read_text())
+        self.assertEqual(result_data["validationScore"], 0.75)
+        self.assertEqual(artifact["program"]["kind"], "python")
         with tempfile.TemporaryDirectory() as prediction_directory:
             target = Path(prediction_directory)
             (target / "user_program.py").write_text(CUSTOM_PROGRAM)
@@ -275,6 +319,42 @@ class DspyTaskTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("source hash mismatch", result.stderr)
             self.assertFalse((target / "predictions.jsonl").exists())
+
+    def test_custom_program_round_trip_with_configured_nested_paths(self):
+        files = {
+            "program": "modules/my translator.py",
+            "train": "inputs/examples.jsonl",
+            "validation": "inputs/held out.jsonl",
+            "candidate": "compiled/model.json",
+            "result": "reports/evaluation.json",
+            "artifact": "saved/original.json",
+            "dataset": "requests/batch.jsonl",
+            "predictions": "answers/output.jsonl",
+            "summary": "reports/prediction.json",
+        }
+        source = self.directory / files["program"]
+        source.parent.mkdir()
+        source.write_text(CUSTOM_PROGRAM)
+        for role, identifier in (("train", "train"), ("validation", "validation")):
+            dataset(self.directory / files[role], [{
+                "schemaVersion": 1, "id": identifier, "inputs": {"sentence": "bonjour"},
+            }])
+        config = self.config("optimize", signature=None, metricFunction="translation_metric", files=files)
+        result = self.run_task(self.directory, config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifact = self.directory / files["artifact"]
+        artifact.parent.mkdir()
+        artifact.write_bytes((self.directory / files["candidate"]).read_bytes())
+        dataset(self.directory / files["dataset"], [{
+            "schemaVersion": 1, "id": "test", "inputs": {"sentence": "salut"},
+        }])
+        result = self.run_task(self.directory, self.config("predict", signature=None, files=files))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prediction = json.loads((self.directory / files["predictions"]).read_text())
+        self.assertEqual(prediction["outputs"], {"translation": "translated"})
+        self.assertTrue((self.directory / files["summary"]).is_file())
+        self.assertFalse((self.directory / "candidate.json").exists())
+        self.assertFalse((self.directory / "predictions.jsonl").exists())
 
 
 if __name__ == "__main__":

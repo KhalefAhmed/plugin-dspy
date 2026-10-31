@@ -1,6 +1,10 @@
 package io.kestra.plugin.dspy;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 import io.kestra.core.junit.annotations.KestraTest;
 import io.kestra.core.models.property.Property;
@@ -8,7 +12,10 @@ import io.kestra.core.runners.RunContextFactory;
 import io.kestra.core.utils.TestsUtils;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -16,6 +23,146 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class DspyTest {
     @Inject
     RunContextFactory runContextFactory;
+
+    @TempDir
+    Path directory;
+
+    @Test
+    void validatesDatasetContractsInJava() throws Exception {
+        String valid = """
+            {"schemaVersion":1,"id":"one","inputs":{"text":"invoice"},"reference":{"category":"billing"}}
+            """;
+        Path dataset = directory.resolve("dataset.jsonl");
+        for (String invalid : new String[] {
+            "", valid + valid, "not-json\n", valid.replace("\"inputs\":{\"text\":\"invoice\"}", "\"inputs\":[]"),
+            valid.replace("\"schemaVersion\":1", "\"schemaVersion\":true"),
+            valid.replace("\"schemaVersion\":1", "\"schemaVersion\":1.0"),
+            valid.replace("\"one\"", "\"\\u00a0\""),
+            valid.replace("\"category\"", "\"text\""),
+            valid.replace("{\"category\":\"billing\"}", "{}"),
+            valid.replace("{\"category\":\"billing\"}", "null"),
+            valid.replace("\"invoice\"", "1e999"),
+            valid.strip() + " {}\n"
+        }) {
+            Files.writeString(dataset, invalid);
+            assertThrows(IllegalArgumentException.class, () -> DspyDataset.read(dataset, "dataset.jsonl", true));
+        }
+        Files.writeString(dataset, valid);
+        DspyDataset validated = DspyDataset.read(dataset, "dataset.jsonl", true);
+        assertEquals(Set.of("one"), validated.ids());
+        assertEquals(Set.of(Set.of("category")), validated.referenceFields());
+        assertEquals(DspyDataset.digest(dataset), validated.sha256());
+        Files.writeString(dataset, """
+            {"schemaVersion":1,"id":"test","inputs":{"text":"{{ keep this literal }}"}}
+            """);
+        assertEquals(Set.of(Set.of()), DspyDataset.read(dataset, "dataset.jsonl", false).referenceFields());
+        assertThrows(IllegalArgumentException.class, () -> DspyDataset.read(dataset, "dataset.jsonl", true));
+    }
+
+    @Test
+    void rejectsOverlappingAndInconsistentOptimizationDatasetsBeforeTheRunner() throws Exception {
+        Optimize task = Optimize.builder()
+            .id("optimize")
+            .type(Optimize.class.getName())
+            .signature(Property.ofValue("text -> category"))
+            .studentModel(Property.ofValue("openai/student"))
+            .teacherModel(Property.ofValue("openai/teacher"))
+            .trainsetUri(Property.ofExpression("{{ inputs.train }}"))
+            .validationUri(Property.ofExpression("{{ inputs.validation }}"))
+            .build();
+        var uploadContext = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        Path train = directory.resolve("train.jsonl");
+        String row = """
+            {"schemaVersion":1,"id":"train","inputs":{"text":"invoice"},"reference":{"category":"billing"}}
+            """;
+        Files.writeString(train, row);
+        String trainUri = uploadContext.storage().putFile(train.toFile()).toString();
+        for (String validationRow : new String[] {row, row.replace("\"train\"", "\"validation\"").replace("\"category\"", "\"answer\"")}) {
+            Path validation = directory.resolve("validation.jsonl");
+            Files.writeString(validation, validationRow);
+            String validationUri = uploadContext.storage().putFile(validation.toFile()).toString();
+            var context = TestsUtils.mockRunContext(runContextFactory, task, Map.of("train", trainUri, "validation", validationUri));
+            var error = assertThrows(IllegalArgumentException.class, () -> task.run(context));
+            assertTrue(error.getMessage().contains("disjoint") || error.getMessage().contains("same output fields"));
+        }
+    }
+
+    @Test
+    void derivesOptimizationReferenceFieldsFromArbitraryUserData() throws Exception {
+        Optimize task = Optimize.builder().id("optimize").type(Optimize.class.getName()).build();
+        var context = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        String row = """
+            {"schemaVersion":1,"id":"train","inputs":{"source":"bonjour","locale":"en"},
+             "reference":{"translation":"hello","confidence":0.9}}
+            """.replace("\n", "") + "\n";
+        Path train = directory.resolve("train.jsonl");
+        Path validation = directory.resolve("validation.jsonl");
+        Files.writeString(train, row);
+        Files.writeString(validation, row.replace("\"train\"", "\"validation\""));
+        Map<String, Object> config = new LinkedHashMap<>(Map.of(
+            "operation", "optimize", "signature", "source, locale -> translation, confidence: float",
+            "predictor", "PREDICT"
+        ));
+        DspyInputs.prepare(context, config, Map.of(
+            "train", context.storage().putFile(train.toFile()).toString(),
+            "validation", context.storage().putFile(validation.toFile()).toString()
+        ), Map.of("train", "inputs/custom-training.jsonl", "validation", "inputs/custom-validation.jsonl"));
+        assertEquals(Set.of("translation", "confidence"), config.get("referenceFields"));
+        var datasets = io.kestra.core.serializers.JacksonMapper.ofJson().valueToTree(config.get("datasets"));
+        assertEquals("bonjour", datasets.get("train").get(0).get("inputs").get("source").asText());
+        assertEquals(0.9, datasets.get("validation").get(0).get("reference").get("confidence").asDouble());
+        var program = io.kestra.core.serializers.JacksonMapper.ofJson().valueToTree(config.get("program"));
+        assertEquals(config.get("signature"), program.get("signature").asText());
+    }
+
+    @Test
+    void stagesExactSourceBytesAndBuildsCustomProgramDescriptor() throws Exception {
+        Predict task = Predict.builder().id("predict").type(Predict.class.getName()).build();
+        var context = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+        Path dataset = directory.resolve("dataset.jsonl");
+        String contents = "{\"schemaVersion\":1,\"id\":\"test\",\"inputs\":{\"text\":\"{{ not a template }}\"}}\r\n";
+        Files.writeString(dataset, contents);
+        Path program = directory.resolve("program.py");
+        Files.writeString(program, "def build_program():\n    pass\n");
+        String sourceHash = DspyDataset.digest(program);
+        Map<String, Object> config = new LinkedHashMap<>(Map.of("operation", "predict", "programFactory", "build_program"));
+        var staged = DspyInputs.prepare(context, config, Map.of(
+            "dataset", context.storage().putFile(dataset.toFile()).toString(),
+            "program", context.storage().putFile(program.toFile()).toString()
+        ), Map.of("dataset", "inputs/custom-dataset.jsonl", "program", "modules/custom-program.py"));
+        assertEquals(Map.of("kind", "python", "factory", "build_program", "sha256", sourceHash), config.get("program"));
+        var datasets = io.kestra.core.serializers.JacksonMapper.ofJson().valueToTree(config.get("datasets"));
+        assertEquals("{{ not a template }}", datasets.get("dataset").get(0).get("inputs").get("text").asText());
+        try (var stream = context.storage().getFile(java.net.URI.create(staged.get("inputs/custom-dataset.jsonl")))) {
+            assertEquals(contents, new String(stream.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+        }
+        assertFalse(config.containsKey("referenceFields"));
+    }
+
+    @Test
+    void rejectsInvalidRunnerPathsBeforeFetchingFiles() {
+        for (Map<String, String> paths : java.util.List.of(
+            Map.of("unknown", "input.jsonl"),
+            Map.of("dataset", ""),
+            Map.of("dataset", "/outside.jsonl"),
+            Map.of("dataset", "../outside.jsonl"),
+            Map.of("dataset", "inputs/*.jsonl"),
+            Map.of("dataset", "inputs/\n*.jsonl"),
+            Map.of("dataset", "dspy_task.py"),
+            Map.of("dataset", "dspy_config.json"),
+            Map.of("dataset", "shared.jsonl", "predictions", "shared.jsonl")
+        )) {
+            Predict task = Predict.builder()
+                .id("predict").type(Predict.class.getName())
+                .signature(Property.ofValue("source -> answer"))
+                .model(Property.ofValue("openai/student"))
+                .datasetUri(Property.ofValue("kestra:///dataset.jsonl"))
+                .filePaths(Property.ofValue(paths))
+                .build();
+            var context = TestsUtils.mockRunContext(runContextFactory, task, Map.of());
+            assertThrows(IllegalArgumentException.class, () -> task.run(context));
+        }
+    }
 
     @Test
     void rejectsInlineDataInsteadOfAnArtifactUri() {
