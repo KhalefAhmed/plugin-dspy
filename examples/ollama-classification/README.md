@@ -1,175 +1,215 @@
-# Flow DSPy local : prédire, optimiser et réutiliser
+# Local DSPy flow: predict, optimize and reuse
 
-Ce flow Kestra classe des messages clients avec DSPy et Ollama, sans clé API
-ni fournisseur payant. Il compare les prédictions d'un programme initial avec
-celles d'un programme auquel DSPy a ajouté des exemples d'entraînement.
+You can test the DSPy plugin with this example using Kestra and local Ollama
+models, without an API key or a paid provider. The flow classifies customer
+messages, evaluates a baseline and an optimized candidate, and selects the
+candidate only when it passes the validation checks.
 
-## Fichiers
+## Files
 
-Tous les fichiers sont dans `examples/ollama-classification/` :
+All files are in `examples/ollama-classification/`:
 
-| Fichier | Utilisation |
+| File | Purpose |
 |---|---|
-| `flow.yaml` | Définition du flow à importer dans Kestra. |
-| `train.jsonl` | Six messages corrigés pour construire les démonstrations. |
-| `validation.jsonl` | Trois autres messages corrigés pour évaluer le candidat. |
-| `test.jsonl` | Trois messages utilisés pour les prédictions avant et après optimisation. |
+| `flow.yaml` | Flow definition to import into Kestra. |
+| `train.jsonl` | Six labeled messages used to build demonstrations. |
+| `validation.jsonl` | Three separate labeled messages used to evaluate the baseline and candidate. |
+| `test.jsonl` | Three messages used to evaluate predictions before optimization and, if accepted, after optimization. |
 
-Chaque ligne JSONL représente un exemple :
+Each JSONL line represents an example:
 
 ```json
 {"schemaVersion":1,"id":"train-1","inputs":{"text":"I was charged twice for my subscription."},"reference":{"category":"billing"}}
 ```
 
-- `schemaVersion` : version du format attendu par le plugin.
-- `id` : identifiant unique de l'exemple.
-- `inputs` : valeurs transmises au programme DSPy.
-- `reference` : réponse attendue, utilisée pour l'entraînement ou l'évaluation.
+- `schemaVersion`: format version expected by the plugin.
+- `id`: unique example identifier.
+- `inputs`: values passed to the DSPy program.
+- `reference`: expected output, used for training or evaluation.
 
-Les trois fichiers utilisent des identifiants distincts. Les références du
-fichier de test servent à une comparaison manuelle : `Predict` ne les utilise
-pas pour produire les réponses.
+The three files use disjoint IDs. With `evaluate: true`, `Predict` uses test
+references to score predictions, not to generate answers. Test scores never
+determine whether the candidate is accepted.
 
-## Enchaînement
+## Flow sequence
 
 ```mermaid
 flowchart TD
-    test[test.jsonl] --> baseline[baseline : prédiction initiale]
-    baseline --> optimize[optimize : construction et validation du candidat]
+    test[test.jsonl] --> baseline[baseline: initial test predictions]
+    validation[validation.jsonl] --> baseline_validation[baseline_validation: baseline score]
+    baseline --> baseline_validation
+    baseline_validation --> optimize[optimize: build and validate candidate]
     train[train.jsonl] --> optimize
-    validation[validation.jsonl] --> optimize
-    optimize --> artifact[candidate.json : état du programme]
-    artifact --> optimized[optimized : prédiction avec le candidat]
+    validation --> optimize
+    optimize --> artifact[candidate.json: program state]
+    artifact --> candidate_validation[candidate_validation: candidate score]
+    validation --> candidate_validation
+    baseline_validation --> select_candidate{Validation checks pass?}
+    candidate_validation --> select_candidate
+    select_candidate -->|Yes| optimized[optimized: candidate test predictions]
+    artifact --> optimized
     test --> optimized
+    select_candidate -->|No| retain_baseline[retain_baseline: keep initial predictions]
 ```
 
-Kestra exécute les trois tâches dans l'ordre. Si une tâche échoue, les suivantes
-ne sont pas exécutées.
+Kestra runs the top-level tasks in order, then executes the selected branch.
+If a task fails, subsequent tasks are not executed; the baseline fallback applies
+to a rejected validation score, not to execution failures.
 
-### 1. `baseline` : prédire avant optimisation
+### 1. `baseline` and `baseline_validation`: evaluate the initial program
 
-La tâche `io.kestra.plugin.dspy.Predict` utilise :
+Both `io.kestra.plugin.dspy.Predict` tasks use:
 
-- La signature `text -> category`.
-- Des instructions définissant les catégories `billing`, `technical` et `other`.
-- Le modèle local `ollama_chat/llama3.2:1b`.
-- Le fichier `test.jsonl`.
+- The `text -> category` signature.
+- Instructions defining the `billing`, `technical` and `other` categories.
+- The local `ollama_chat/llama3.2:1b` model.
+- `responseFormat: JSON` to request JSON output.
+- `evaluate: true` to score predictions against references.
 
-Elle produit des prédictions initiales, sans les démonstrations apprises depuis
-`train.jsonl`. Les instructions contiennent néanmoins déjà quelques exemples
-rédigés manuellement.
+`baseline` processes `test.jsonl`; `baseline_validation` processes
+`validation.jsonl`. Neither uses demonstrations learned from `train.jsonl`,
+although the shared instructions already contain a few manually written examples.
 
-### 2. `optimize` : construire et évaluer un candidat
+### 2. `optimize`: build and evaluate a candidate
 
-La tâche `io.kestra.plugin.dspy.Optimize` utilise l'algorithme
-`BOOTSTRAP_FEW_SHOT`.
+The `io.kestra.plugin.dspy.Optimize` task uses `BOOTSTRAP_FEW_SHOT`.
 
-DSPy utilise les données d'entraînement et un programme enseignant pour tenter
-de construire des démonstrations correctes. Dans cet exemple :
+DSPy uses training data and a teacher program to build correct demonstrations.
+In this example:
 
-- L'étudiant et l'enseignant utilisent le même modèle local pour limiter les
-  téléchargements et les ressources nécessaires.
-- `maxBootstrappedDemos: 1` limite les démonstrations générées et acceptées.
-- `maxLabeledDemos: 6` limite les exemples corrigés pouvant être ajoutés.
-- `metricThreshold: 1.0` exige une réponse correcte pour accepter une
-  démonstration générée.
+- The student uses `ollama_chat/llama3.2:1b`.
+- The teacher uses the larger `ollama_chat/llama3.2:3b` model.
+- `maxBootstrappedDemos: 1` limits accepted generated demonstrations.
+- `maxLabeledDemos: 6` limits labeled examples that can be added.
+- `metricThreshold: 1.0` requires a correct answer to accept a generated
+  demonstration.
 
-Le candidat est ensuite évalué sur `validation.jsonl`, qui ne sert pas à
-construire ses démonstrations. La métrique par défaut compare les catégories
-prédites aux références, en normalisant notamment la casse et les espaces.
+The candidate is then evaluated on `validation.jsonl`, which is not used to
+build its demonstrations. The default metric compares predicted categories with
+references, normalizing case and whitespace among other transformations.
 
-Le fichier `manifest.json` contient le score de validation. Par exemple,
-`validation.score: 0.666...` signifie deux bonnes réponses sur trois.
+The manifest contains this validation score. For example,
+`validation.score: 0.666...` means two correct answers out of three.
 
-**Le seuil `metricThreshold` n'est pas une barrière de validation finale.**
-Ce flow continue même si le score de validation est faible.
+**`metricThreshold` is not the final candidate acceptance threshold.**
+Candidate selection happens later in `select_candidate`.
 
-L'optimisation produit :
+Optimization produces:
 
-- `candidate.json` : signature, instructions, état DSPy et démonstrations du candidat.
-- `manifest.json` : modèles, versions, paramètres, empreintes des données,
-  score de validation et compteurs d'appels.
+- `candidate.json`: program definition, response format, student model, DSPy
+  state and candidate demonstrations.
+- A manifest: models, versions, parameters, dataset hashes, validation score
+  and model-call counts.
 
-**Il ne s'agit pas de fine-tuning : les poids du modèle Ollama ne sont pas
-modifiés.** DSPy optimise ici les démonstrations fournies au modèle.
+**This is not fine-tuning: Ollama model weights are not modified.**
+DSPy optimizes the demonstrations supplied to the model.
 
-### 3. `optimized` : réutiliser le candidat
+### 3. `candidate_validation` and `select_candidate`: select the program
 
-La dernière tâche `Predict` charge :
+`candidate_validation` reloads the candidate artifact and evaluates it again on
+`validation.jsonl`. `select_candidate` accepts it only if this score:
+
+- Meets `minimum_validation_score`, which defaults to `0.8`.
+- Is at least as high as `baseline_validation.evaluationScore`.
+
+With only three validation examples, the default threshold requires three
+correct answers. The manifest score comes from the evaluation during optimization;
+selection uses the separate `candidate_validation` score. These scores may differ
+because model responses are not guaranteed to be deterministic.
+
+### 4. `optimized` or `retain_baseline`: use the selected program
+
+If accepted, the `optimized` task loads:
 
 ```yaml
 artifactUri: "{{ outputs.optimize.candidateArtifactUri }}"
 ```
 
-Elle récupère ainsi la définition du programme et le modèle étudiant enregistrés
-dans l'artefact, puis traite le même `test.jsonl` que `baseline`.
+It restores the program definition, response format and student model saved in
+the artifact, then predicts and evaluates on the same `test.jsonl` as `baseline`,
+without running optimization again.
 
-Elle ne relance pas l'optimisation. Cela permet de comparer les réponses avant
-et après ajout des démonstrations.
+If rejected, `retain_baseline` logs the decision and the flow returns the initial
+baseline predictions instead.
 
-## Exécution dans Kestra
+## Run in Kestra
 
-Prérequis :
+Prerequisites:
 
-- Kestra avec le JAR du plugin DSPy chargé et l'accès au socket Docker.
-- L'image Docker `plugin-dspy:3.4.1` disponible sur le Docker du worker.
-- Ollama démarré sur le Mac avec le modèle `llama3.2:1b` téléchargé.
+- Kestra with the DSPy plugin JAR loaded and access to Docker for the TaskRunner.
+- The `plugin-dspy:3.4.1` image available on the worker's Docker daemon.
+- Ollama running on your Mac with both `llama3.2:1b` and `llama3.2:3b` downloaded.
 
-Le flow cible Docker Desktop sur Mac : les conteneurs joignent Ollama avec
-`http://host.docker.internal:11434`. Pour une autre infrastructure, adapter
-`DSPY_STUDENT_API_BASE` et `DSPY_TEACHER_API_BASE`.
+Download the models:
 
-Pour lancer le flow :
+```bash
+ollama pull llama3.2:1b
+ollama pull llama3.2:3b
+```
 
-1. Créer un flow dans Kestra et y copier le contenu de `flow.yaml`.
-2. Enregistrer, puis cliquer sur **Execute**.
-3. Joindre `train.jsonl` au champ `train`.
-4. Joindre `validation.jsonl` au champ `validation`.
-5. Joindre `test.jsonl` au champ `test`, puis lancer.
+The flow targets Docker Desktop on Mac: containers reach Ollama through
+`http://host.docker.internal:11434`. Ollama must listen on an address reachable
+from Docker. If needed, stop the existing Ollama server and start it with:
 
-## Résultats
+```bash
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+```
 
-Dans l'onglet **Outputs**, les sorties du flow exposent les URI suivantes :
+This also exposes Ollama to the local network; use it only on a trusted network
+with appropriate access restrictions. For other infrastructure, adapt
+`DSPY_STUDENT_API_BASE` and `DSPY_TEACHER_API_BASE`.
 
-| Sortie | Contenu |
+To run the flow:
+
+1. Create a flow in Kestra and paste the contents of `flow.yaml`.
+2. Save it, then click **Execute**.
+3. Attach `train.jsonl`, `validation.jsonl` and `test.jsonl` to their corresponding inputs.
+4. Set `minimum_validation_score` if needed, then start the execution.
+
+## Results
+
+The flow exposes these values in the **Outputs** tab:
+
+| Output | Content |
 |---|---|
-| `baseline_predictions` | Prédictions avant optimisation. |
-| `optimized_predictions` | Prédictions après optimisation. |
-| `validation_report` | Rapport du candidat, dont `validation.score`. |
-| `reusable_artifact` | Programme optimisé pouvant être réutilisé dans un autre flow. |
+| `baseline_predictions` | URI of predictions before optimization. |
+| `selected_predictions` | URI of candidate predictions if accepted, otherwise baseline predictions. |
+| `validation_report` | URI of the optimization manifest, including `validation.score`. |
+| `candidate_artifact` | URI of the candidate program, available even if rejected. |
+| `candidate_accepted` | Whether the candidate passed the selection checks. |
+| `baseline_validation_score` | Baseline score on the validation dataset. |
+| `candidate_validation_score` | Candidate score used for selection. |
 
-Les fichiers sont conservés dans le stockage interne de Kestra, pas
-automatiquement dans le dossier du projet. Les sorties des tâches sont également
-accessibles : `baseline.predictionsUri`, `optimized.predictionsUri`,
-`optimize.manifestUri` et `optimize.candidateArtifactUri`.
+Files are kept in Kestra's internal storage, not automatically in the project
+directory. Task outputs also expose `baseline.predictionsUri`,
+`optimize.manifestUri` and `optimize.candidateArtifactUri`.
+`optimized.predictionsUri` is available only when the candidate is accepted.
 
-Chaque prédiction contient le texte d'entrée et la catégorie produite :
+Each prediction contains the input text and the generated category:
 
 ```json
 {"schemaVersion":1,"id":"test-1","inputs":{"text":"Please send me my invoice."},"outputs":{"category":"billing"},"artifactVersion":"..."}
 ```
 
-Pour ce jeu de test, les catégories attendues sont :
+The expected test categories are:
 
-| Identifiant | Catégorie attendue |
+| ID | Expected category |
 |---|---|
 | `test-1` | `billing` |
 | `test-2` | `technical` |
 | `test-3` | `other` |
 
-Le flow ne calcule pas automatiquement de score avant/après sur le test :
-comparer les deux fichiers de prédictions avec ces références. Le score dans
-`validation_report` porte uniquement sur le jeu de validation du candidat.
+Test evaluation scores are available as `outputs.baseline.evaluationScore` and,
+if accepted, `outputs.optimized.evaluationScore`. They are reported for comparison
+only and do not affect candidate selection.
 
-## Limites
+## Limitations
 
-- `llama3.2:1b` est un petit modèle : il peut mal classer un texte ou ne pas
-  respecter le format DSPy, ce qui peut faire échouer une tâche.
-- L'optimisation ne garantit pas une amélioration, surtout avec le même petit
-  modèle pour l'enseignant et l'étudiant.
-- Ces quelques exemples servent à une démonstration technique, pas à une mesure
-  fiable de qualité en production.
-- Les budgets `maxLlmCalls` s'appliquent séparément à chaque tâche. Les délais
-  limitent les requêtes individuelles et la durée globale des tâches.
-- L'artefact peut contenir des exemples d'entraînement : le traiter comme les
-  données sources s'ils sont confidentiels.
+- `llama3.2:1b` is a small model: it may misclassify text or return invalid output,
+  causing a task to fail. JSON response format does not guarantee valid answers.
+- Optimization does not guarantee improvement, even with a larger teacher.
+- These few examples demonstrate the integration, not reliable production quality.
+- `maxLlmCalls` budgets apply separately to each task attempt. Request and task
+  timeouts bound individual calls and overall task duration.
+- The artifact may contain training examples; treat it like the source datasets
+  if they are confidential.
