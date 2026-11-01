@@ -1,7 +1,6 @@
 package io.kestra.plugin.dspy;
 
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -50,18 +49,29 @@ class DspyDockerTest {
         );
     }
 
+    @Test
+    void optimizeThenPredictInheritsJsonResponseFormat() throws Exception {
+        roundTrip(Map.of(), Map.of(), AbstractDspy.ResponseFormat.JSON);
+    }
+
     private void roundTrip(Map<String, String> optimizePaths, Map<String, String> predictPaths) throws Exception {
+        roundTrip(optimizePaths, predictPaths, null);
+    }
+
+    private void roundTrip(Map<String, String> optimizePaths, Map<String, String> predictPaths, AbstractDspy.ResponseFormat responseFormat) throws Exception {
         List<String> models = new CopyOnWriteArrayList<>();
         HttpServer server = HttpServer.create(new InetSocketAddress(0), 0);
         server.createContext("/v1/chat/completions", exchange -> {
             var request = JacksonMapper.ofJson().readTree(exchange.getRequestBody());
             models.add(request.get("model").asText());
-            byte[] response = """
-                {"id":"fake","object":"chat.completion","created":0,"model":"fake",
-                "choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant",
-                "content":"[[ ## category ## ]]\\nbilling\\n\\n[[ ## completed ## ]]"}}],
-                "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}
-                """.getBytes(StandardCharsets.UTF_8);
+            String content = request.has("response_format") ? "{\"category\":\"billing\"}"
+                : "[[ ## category ## ]]\nbilling\n\n[[ ## completed ## ]]";
+            byte[] response = JacksonMapper.ofJson().writeValueAsBytes(Map.of(
+                "id", "fake", "object", "chat.completion", "created", 0, "model", "fake",
+                "choices", List.of(Map.of("index", 0, "finish_reason", "stop",
+                    "message", Map.of("role", "assistant", "content", content))),
+                "usage", Map.of("prompt_tokens", 10, "completion_tokens", 5, "total_tokens", 15)
+            ));
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, response.length);
             try (var body = exchange.getResponseBody()) {
@@ -76,7 +86,7 @@ class DspyDockerTest {
                 "DSPY_TEACHER_API_BASE", endpoint,
                 "OPENAI_API_KEY", "fake-test-key"
             ));
-            Optimize optimize = Optimize.builder()
+            var optimizeBuilder = Optimize.builder()
                 .id("optimize")
                 .type(Optimize.class.getName())
                 .taskRunner(runner())
@@ -88,8 +98,11 @@ class DspyDockerTest {
                 .trainsetUri(Property.ofExpression("{{ inputs.train }}"))
                 .validationUri(Property.ofExpression("{{ inputs.validation }}"))
                 .filePaths(Property.ofValue(optimizePaths))
-                .env(env)
-                .build();
+                .env(env);
+            if (responseFormat != null) {
+                optimizeBuilder.responseFormat(Property.ofValue(responseFormat));
+            }
+            Optimize optimize = optimizeBuilder.build();
             RunContext uploadContext = TestsUtils.mockRunContext(runContextFactory, optimize, Map.of());
             var train = upload(uploadContext, "train", row("train", true));
             var validation = upload(uploadContext, "validation", row("validation", true));
@@ -100,6 +113,7 @@ class DspyDockerTest {
                 var manifest = JacksonMapper.ofJson().readTree(input);
                 assertEquals(1.0, manifest.get("validation").get("score").asDouble());
                 assertEquals("normalized_exact_match_v1", manifest.get("validation").get("metric").asText());
+                assertEquals(responseFormat == null ? "CHAT" : responseFormat.name(), manifest.get("responseFormat").asText());
                 assertEquals(1, manifest.get("train").get("count").asInt());
                 try (var artifact = optimizeContext.storage().getFile(candidate.getCandidateArtifactUri())) {
                     Path file = directory.resolve("candidate.json");
@@ -111,18 +125,20 @@ class DspyDockerTest {
                 }
             }
 
-            var dataset = upload(uploadContext, "dataset", row("test", false));
+            var dataset = upload(uploadContext, "dataset", row("test", true));
             Predict predict = Predict.builder()
                 .id("predict")
                 .type(Predict.class.getName())
                 .taskRunner(runner())
                 .artifactUri(Property.ofValue(candidate.getCandidateArtifactUri().toString()))
                 .datasetUri(Property.ofValue(dataset))
+                .evaluate(Property.ofValue(true))
                 .filePaths(Property.ofValue(predictPaths))
                 .env(env)
                 .build();
             RunContext predictContext = TestsUtils.mockRunContext(runContextFactory, predict, Map.of());
             Predict.Output output = predict.run(predictContext);
+            assertEquals(1.0, output.getEvaluationScore());
             try (var input = predictContext.storage().getFile(output.getPredictionsUri())) {
                 var prediction = JacksonMapper.ofJson().readTree(input);
                 assertEquals("billing", prediction.get("outputs").get("category").asText());

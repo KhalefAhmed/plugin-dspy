@@ -1,0 +1,163 @@
+id: dspy_predict_iceberg_batches
+namespace: company.team
+description: |
+  Read an Iceberg table through Athena, split the results into bounded batches,
+  run the same declarative DSPy program on each batch, and upload predictions to S3.
+
+# Requires Kestra 2.0.7+, the AWS, Serdes and Python Script plugins, the DSPy JAR,
+# and the plugin-dspy:3.4.1 image on the worker's Docker daemon.
+# Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, OPENAI_API_KEY.
+# Athena's default workgroup must support Iceberg (engine version 3).
+# AWS credentials need Athena query access, Glue catalog access, read access to
+# the Iceberg table's S3 objects, and read/write access to query results and outputs.
+# The query must return unique, non-blank string ids and an inputs_json VARCHAR.
+# Example query for a signature "source -> result":
+# SELECT CAST(id AS VARCHAR) AS id,
+#        json_format(CAST(MAP(ARRAY['source'], ARRAY[source]) AS JSON)) AS inputs_json
+# FROM documents FOR VERSION AS OF 123456789;
+# Replace the table, fields and snapshot id with your own values.
+# Results stay in separate S3 files; this flow does not write an Iceberg table.
+
+inputs:
+  - id: aws_region
+    type: STRING
+    defaults: eu-west-1
+  - id: athena_database
+    type: STRING
+  - id: select_query
+    type: STRING
+    description: |
+      Trusted SELECT returning id and inputs_json. inputs_json must encode an
+      object whose keys match the DSPy signature. Use a specific Iceberg snapshot
+      for reproducibility and ensure ids are unique across the whole query result.
+  - id: athena_output_location
+    type: STRING
+    description: "S3 location for Athena query results, for example s3://my-bucket/athena/"
+  - id: destination_bucket
+    type: STRING
+  - id: destination_prefix
+    type: STRING
+    defaults: dspy/predictions
+  - id: batch_size
+    type: INT
+    min: 1
+    defaults: 100
+    description: "Maximum rows per Predict task; tune for row size and worker memory."
+  - id: signature
+    type: STRING
+    defaults: "source -> result"
+  - id: instructions
+    type: STRING
+    description: "Instructions for your declarative DSPy program."
+  - id: model
+    type: STRING
+    defaults: openai/gpt-4.1-mini
+
+tasks:
+  - id: read_iceberg
+    type: io.kestra.plugin.aws.athena.Query
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "{{ inputs.aws_region }}"
+    database: "{{ inputs.athena_database }}"
+    outputLocation: "{{ inputs.athena_output_location }}"
+    query: "{{ inputs.select_query }}"
+    fetchType: STORE
+    skipHeader: true
+    timeout: PT2H
+
+  - id: process_nonempty_result
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.read_iceberg.size > 0 }}"
+    then:
+      - id: to_jsonl
+        type: io.kestra.plugin.serdes.json.IonToJson
+        from: "{{ outputs.read_iceberg.uri }}"
+        newLine: true
+
+      - id: split_batches
+        type: io.kestra.plugin.core.storage.Split
+        from: "{{ outputs.to_jsonl.uri }}"
+        rows: "{{ inputs.batch_size }}"
+
+      # Loop uses item.value and isolated iteration outputs in Kestra 2.x.
+      # Three concurrent iterations means at most three Predict tasks at once.
+      - id: process_batches
+        type: io.kestra.plugin.core.flow.Loop
+        values: "{{ outputs.split_batches.uris }}"
+        concurrencyLimit: 3
+        tasks:
+          - id: prepare_batch
+            type: io.kestra.plugin.scripts.python.Script
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: plugin-dspy:3.4.1
+            inputFiles:
+              athena-rows.jsonl: "{{ item.value }}"
+            outputFiles:
+              - dataset.jsonl
+            script: |
+              import json
+              from pathlib import Path
+
+              partial = Path("dataset.partial")
+              count = 0
+              with Path("athena-rows.jsonl").open(encoding="utf-8") as source, partial.open(
+                  "w", encoding="utf-8"
+              ) as target:
+                  for line_number, line in enumerate(source, 1):
+                      row = json.loads(line)
+                      if not isinstance(row, dict):
+                          raise ValueError(f"Expected an object at row {line_number}")
+                      identifier = row.get("id")
+                      if not isinstance(identifier, str) or not identifier.strip():
+                          raise ValueError(f"Expected a non-blank string id at row {line_number}")
+                      encoded_inputs = row.get("inputs_json")
+                      if not isinstance(encoded_inputs, str):
+                          raise ValueError(f"Expected inputs_json as a string at row {line_number}")
+                      inputs = json.loads(encoded_inputs)
+                      if not isinstance(inputs, dict):
+                          raise ValueError(f"Expected inputs_json to encode an object at row {line_number}")
+                      record = {"schemaVersion": 1, "id": identifier, "inputs": inputs}
+                      target.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+                      count += 1
+              if count == 0:
+                  raise ValueError("The batch must not be empty")
+              partial.replace("dataset.jsonl")
+              print(f"Prepared {count} records")
+
+          - id: predict_batch
+            type: io.kestra.plugin.dspy.Predict
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: plugin-dspy:3.4.1
+            datasetUri: "{{ outputs.prepare_batch.outputFiles['dataset.jsonl'] }}"
+            signature: "{{ inputs.signature }}"
+            instructions: "{{ inputs.instructions }}"
+            predictor: PREDICT
+            model: "{{ inputs.model }}"
+            maxLlmCalls: "{{ inputs.batch_size }}"
+            timeout: PT2H
+            env:
+              OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
+
+          - id: upload_predictions
+            type: io.kestra.plugin.aws.s3.Upload
+            accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+            secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+            region: "{{ inputs.aws_region }}"
+            bucket: "{{ inputs.destination_bucket }}"
+            key: "{{ inputs.destination_prefix }}/{{ execution.id }}/batch-{{ item.index }}.jsonl"
+            from: "{{ outputs.predict_batch.predictionsUri }}"
+    else:
+      - id: no_records
+        type: io.kestra.plugin.core.log.Log
+        message: "The Athena query returned no records; no predictions were requested."
+
+outputs:
+  - id: source_row_count
+    type: INT
+    value: "{{ outputs.read_iceberg.size }}"
+  - id: predictions_s3_prefix
+    type: STRING
+    value: "s3://{{ inputs.destination_bucket }}/{{ inputs.destination_prefix }}/{{ execution.id }}/"

@@ -20,6 +20,7 @@ final class DspyManifest {
         manifest.put("schemaVersion", 1);
         manifest.set("artifactVersion", required(candidate, "artifactVersion"));
         manifest.set("program", required(candidate, "program"));
+        manifest.set("responseFormat", required(candidate, "responseFormat"));
         try (var stream = context.storage().getFile(candidateUri)) {
             var path = context.workingDir().createTempFile();
             java.nio.file.Files.copy(stream, path, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
@@ -30,7 +31,8 @@ final class DspyManifest {
         }
         for (String field : new String[] {
             "studentModel", "teacherModel", "optimizer", "seed", "maxBootstrappedDemos", "maxLabeledDemos",
-            "metricThreshold", "maxLlmCalls", "maxTokens", "requestTimeoutSeconds", "train"
+            "metricThreshold", "maxLlmCalls", "maxRetries", "maxDatasetBytes", "maxDatasetRows",
+            "maxTokens", "requestTimeoutSeconds", "train"
         }) {
             manifest.set(field, JacksonMapper.ofJson().valueToTree(config.get(field)));
         }

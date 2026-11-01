@@ -1,16 +1,15 @@
 package io.kestra.plugin.dspy;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -19,17 +18,29 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.kestra.core.serializers.JacksonMapper;
 
-record DspyDataset(Set<String> ids, Set<Set<String>> referenceFields, String sha256, List<JsonNode> records) {
-    static DspyDataset read(Path path, String name, boolean supervised) throws IOException {
+record DspyDataset(Set<String> ids, Set<Set<String>> referenceFields, String sha256) {
+    static final long DEFAULT_MAX_BYTES = 64L * 1024 * 1024;
+    static final int DEFAULT_MAX_ROWS = 10_000;
+
+    static DspyDataset read(Path path, boolean supervised) throws IOException {
+        return read(path, "dataset.jsonl", supervised, DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS);
+    }
+
+    static DspyDataset read(Path path, String name, boolean supervised, long maxBytes, int maxRows) throws IOException {
+        if (Files.size(path) > maxBytes) {
+            throw new IllegalArgumentException(name + " exceeds maxDatasetBytes: " + maxBytes);
+        }
         Set<String> ids = new HashSet<>();
         Set<Set<String>> referenceFields = new HashSet<>();
-        List<JsonNode> records = new ArrayList<>();
         var reader = JacksonMapper.ofJson().reader()
             .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         try (var source = Files.newBufferedReader(path)) {
             int lineNumber = 0;
             String line;
             while ((line = source.readLine()) != null) {
+                if (lineNumber >= maxRows) {
+                    throw new IllegalArgumentException(name + " exceeds maxDatasetRows: " + maxRows);
+                }
                 String location = name + ":" + ++lineNumber;
                 JsonNode row;
                 try {
@@ -42,13 +53,27 @@ record DspyDataset(Set<String> ids, Set<Set<String>> referenceFields, String sha
                 }
                 referenceFields.add(validatedReferenceFields(row, location, supervised));
                 validateNumbers(row, location);
-                records.add(row);
             }
         }
         if (ids.isEmpty()) {
             throw new IllegalArgumentException(name + " must not be empty");
         }
-        return new DspyDataset(ids, referenceFields, digest(path), List.copyOf(records));
+        return new DspyDataset(ids, referenceFields, digest(path));
+    }
+
+    static void copy(InputStream source, Path path, String name, long maxBytes) throws IOException {
+        try (var target = Files.newOutputStream(path)) {
+            byte[] buffer = new byte[8192];
+            long total = 0;
+            int size;
+            while ((size = source.read(buffer)) != -1) {
+                if (size > maxBytes - total) {
+                    throw new IllegalArgumentException(name + " exceeds maxDatasetBytes: " + maxBytes);
+                }
+                target.write(buffer, 0, size);
+                total += size;
+            }
+        }
     }
 
     Map<String, Object> metadata() {

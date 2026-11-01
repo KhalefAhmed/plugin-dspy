@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,10 +38,22 @@ def translation_metric(example, prediction, trace=None):
 
 class FakeLLM(BaseHTTPRequestHandler):
     models = []
+    statuses = []
+    formats = []
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.models.append(body["model"])
+        self.formats.append("JSON" if "response_format" in body else "CHAT")
+        status = self.statuses.pop(0) if self.statuses else 200
+        if status != 200:
+            payload = json.dumps({"error": {"message": "provider-private-payload", "type": "api_error"}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         system = body["messages"][0]["content"]
         fields = {"translation": "translated"} if "translation" in system else {"category": ANSWER}
         if "entities" in system:
@@ -50,6 +63,8 @@ class FakeLLM(BaseHTTPRequestHandler):
         if "reasoning" in system:
             fields = {"reasoning": "This is an invoice request.", **fields}
         content = "\n\n".join(f"[[ ## {field} ## ]]\n{value}" for field, value in fields.items())
+        if "response_format" in body:
+            content = json.dumps(fields)
         payload = json.dumps({
             "id": "test-completion",
             "object": "chat.completion",
@@ -60,7 +75,7 @@ class FakeLLM(BaseHTTPRequestHandler):
                 "finish_reason": "stop",
                 "message": {
                     "role": "assistant",
-                    "content": content + "\n\n[[ ## completed ## ]]",
+                    "content": content if "response_format" in body else content + "\n\n[[ ## completed ## ]]",
                 },
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
@@ -109,12 +124,15 @@ class DspyTaskTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
         FakeLLM.models.clear()
+        FakeLLM.statuses.clear()
+        FakeLLM.formats.clear()
 
     def config(self, operation, **overrides):
         return {
             "schemaVersion": 1,
             "operation": operation,
             "maxLlmCalls": 10,
+            "maxRetries": 2,
             "requestTimeoutSeconds": 5,
             "maxTokens": 256,
             "studentModel": "openai/student",
@@ -156,14 +174,12 @@ class DspyTaskTest(unittest.TestCase):
                     "sha256": task.digest(directory / files["program"]),
                 }
         config["files"] = files
-        if "datasets" not in config:
-            roles = ("train", "validation") if config["operation"] == "optimize" else ("dataset",)
-            config["datasets"] = {}
-            for role in roles:
-                with (directory / files[role]).open(encoding="utf-8") as source:
-                    config["datasets"][role] = [json.loads(line) for line in source]
         if config["operation"] == "optimize" and not config.get("metricFunction"):
-            config["referenceFields"] = list(config["datasets"]["train"][0]["reference"])
+            with (directory / files["train"]).open(encoding="utf-8") as source:
+                config["referenceFields"] = list(json.loads(source.readline())["reference"])
+        if config.get("evaluate"):
+            with (directory / files["dataset"]).open(encoding="utf-8") as source:
+                config["referenceFields"] = list(json.loads(source.readline())["reference"])
         task.write_json(directory / "config.json", config)
         endpoint = f"http://127.0.0.1:{self.server.server_port}/v1"
         environment = {
@@ -278,15 +294,25 @@ class DspyTaskTest(unittest.TestCase):
                 prediction = json.loads((self.directory / "predictions.jsonl").read_text())
                 self.assertEqual(prediction["outputs"], expected)
 
-    def test_predict_uses_prepared_records_without_reading_dataset_files(self):
-        row = record("prepared", reference=False)
-        row["inputs"]["text"] = "{{ this must remain literal }}"
-        config = self.config("predict", model="openai/student", datasets={"dataset": [row]})
+    def test_prediction_preflights_late_invalid_rows_and_publishes_only_complete_batches(self):
+        rows = [record(str(index), reference=False) for index in range(3)]
+        rows[0]["inputs"]["text"] = "{{ this must remain literal }}"
+        invalid = record("invalid", reference=False)
+        invalid["inputs"] = {"wrong_field": "invoice"}
+        dataset(self.directory / "dataset.jsonl", rows + [invalid])
+        config = self.config("predict", model="openai/student", maxLlmCalls=2)
         result = self.run_task(self.directory, config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(FakeLLM.models, [])
+        dataset(self.directory / "dataset.jsonl", rows)
+        result = self.run_task(self.directory, config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(FakeLLM.models, ["student", "student"])
+        self.assertFalse((self.directory / "predictions.jsonl").exists())
+        result = self.run_task(self.directory, {**config, "maxLlmCalls": 3})
         self.assertEqual(result.returncode, 0, result.stderr)
-        prediction = json.loads((self.directory / "predictions.jsonl").read_text())
-        self.assertEqual(prediction["inputs"], row["inputs"])
-        self.assertFalse((self.directory / "dataset.jsonl").exists())
+        predictions = [json.loads(line) for line in (self.directory / "predictions.jsonl").read_text().splitlines()]
+        self.assertEqual([prediction["inputs"] for prediction in predictions], [row["inputs"] for row in rows])
 
     def test_custom_program_metric_and_source_hash(self):
         (self.directory / "user_program.py").write_text(CUSTOM_PROGRAM)
@@ -355,6 +381,116 @@ class DspyTaskTest(unittest.TestCase):
         self.assertTrue((self.directory / files["summary"]).is_file())
         self.assertFalse((self.directory / "candidate.json").exists())
         self.assertFalse((self.directory / "predictions.jsonl").exists())
+
+    def test_transient_retries_consume_budget_and_redact_provider_payloads(self):
+        dataset(self.directory / "dataset.jsonl", [record("test", reference=False)])
+        FakeLLM.statuses.extend([429, 503])
+        result = self.run_task(self.directory, self.config("predict", model="openai/student", maxLlmCalls=3))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((self.directory / "prediction-summary.json").read_text())
+        self.assertEqual(summary["modelCalls"], {"openai/student": 3})
+        self.assertNotIn("provider-private-payload", result.stderr)
+
+        (self.directory / "predictions.jsonl").unlink()
+        FakeLLM.models.clear()
+        FakeLLM.statuses.append(429)
+        result = self.run_task(self.directory, self.config("predict", model="openai/student", maxLlmCalls=1))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("budget exceeded", result.stderr)
+        self.assertEqual(FakeLLM.models, ["student"])
+        self.assertFalse((self.directory / "predictions.jsonl").exists())
+
+    def test_non_retryable_errors_and_disabled_or_exhausted_retries(self):
+        dataset(self.directory / "dataset.jsonl", [record("test", reference=False)])
+        for status, retries, attempts in ((401, 2, 1), (400, 2, 1), (429, 0, 1), (503, 1, 2)):
+            with self.subTest(status=status, retries=retries):
+                FakeLLM.models.clear()
+                FakeLLM.statuses[:] = [status] * attempts
+                result = self.run_task(self.directory, self.config("predict", model="openai/student", maxRetries=retries))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(FakeLLM.models), attempts)
+                self.assertIn(f"HTTP {status}", result.stderr)
+                self.assertNotIn("provider-private-payload", result.stderr)
+                self.assertFalse((self.directory / "predictions.jsonl").exists())
+
+    def test_timeout_retries_and_concurrent_budget_limits(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        budget = task.Budget(3)
+        task.BudgetLM.budget = budget
+        lm = task.BudgetLM("openai/student", max_retries=1)
+        error = task.dspy.LMTimeoutError("provider-private-payload", model="openai/student")
+        with patch.object(task.dspy.LM, "__call__", side_effect=[error, ["ok"]]), patch.object(task.time, "sleep"):
+            self.assertEqual(lm("invoice"), ["ok"])
+        self.assertEqual(budget.counts, {"openai/student": 2})
+
+        def consume(_):
+            try:
+                budget.consume("openai/student")
+                return True
+            except task.BudgetExceeded:
+                return False
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            self.assertEqual(sum(executor.map(consume, range(30))), 1)
+        self.assertEqual(budget.counts, {"openai/student": 3})
+
+    def test_evaluation_scores_all_rows_without_changing_prediction_outputs(self):
+        rows = [record("correct"), record("incorrect")]
+        rows[1]["reference"]["category"] = "technical"
+        dataset(self.directory / "dataset.jsonl", rows)
+        result = self.run_task(self.directory, self.config("predict", model="openai/student", evaluate=True))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads((self.directory / "prediction-summary.json").read_text())
+        self.assertEqual(summary["evaluationScore"], 0.5)
+        self.assertEqual(summary["count"], 2)
+
+    def test_prediction_does_not_retain_inputs_in_dspy_traces(self):
+        dataset(self.directory / "dataset.jsonl", [record(str(index), reference=False) for index in range(20)])
+        config = self.config("predict", model="openai/student")
+        config["program"] = {"kind": "declarative", "signature": "text -> category", "predictor": "PREDICT"}
+        config["files"] = {
+            "dataset": str(self.directory / "dataset.jsonl"),
+            "predictions": str(self.directory / "predictions.jsonl"),
+            "summary": str(self.directory / "summary.json"),
+        }
+        task.BudgetLM.budget = task.Budget(20)
+        trace = []
+
+        def completion(*args, **kwargs):
+            return ["[[ ## category ## ]]\nbilling\n\n[[ ## completed ## ]]"]
+
+        with task.dspy.context(trace=trace, disable_history=True), patch.object(task.dspy.LM, "__call__", new=completion):
+            task.predict(config)
+        self.assertEqual(trace, [])
+        summary = json.loads((self.directory / "summary.json").read_text())
+        self.assertEqual(summary["count"], 20)
+
+    def test_json_artifact_preserves_response_format_and_allows_explicit_override(self):
+        self.prepare_optimization()
+        result = self.run_task(self.directory, self.config("optimize", responseFormat="JSON"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        artifact = json.loads((self.directory / "candidate.json").read_text())
+        self.assertEqual(artifact["responseFormat"], "JSON")
+        self.assertEqual(FakeLLM.formats, ["JSON", "JSON"])
+        task.write_json(self.directory / "artifact.json", artifact)
+        dataset(self.directory / "dataset.jsonl", [record("test", reference=False)])
+        config = self.config("predict", signature=None)
+        result = self.run_task(self.directory, config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(FakeLLM.formats[-1], "JSON")
+        summary = json.loads((self.directory / "prediction-summary.json").read_text())
+        self.assertEqual(summary["responseFormat"], "JSON")
+        result = self.run_task(self.directory, {**config, "responseFormat": "CHAT"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(FakeLLM.formats[-1], "CHAT")
+
+        artifact.pop("responseFormat")
+        artifact["artifactVersion"] = task.artifact_version(artifact)
+        task.write_json(self.directory / "artifact.json", artifact)
+        result = self.run_task(self.directory, config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(FakeLLM.formats[-1], "CHAT")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,65 @@
+name: Runtime image
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Build runtime and check Python
+        run: bash .github/setup-unit.sh
+      - name: Check Java, Docker integration and plugin packaging
+        run: ./gradlew test lintPluginDocs shadowJar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-jar
+          path: build/libs/*.jar
+          if-no-files-found: error
+
+  publish:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish checked runtime
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: python/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Record immutable image reference
+        run: echo '${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}' >> "$GITHUB_STEP_SUMMARY"

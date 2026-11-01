@@ -12,6 +12,11 @@ signature, input field or output field.
 
 For declarative programs, set `signature` (for example `text -> category`),
 optional `instructions`, and `predictor` (`PREDICT` or `CHAIN_OF_THOUGHT`).
+`responseFormat` selects `CHAT` (DSPy field markers, the default for new programs)
+or `JSON` (JSONAdapter, with native structured output when supported). Neither
+mode retries parsing failures through another adapter. Artifacts retain the
+format; reloading inherits it unless explicitly overridden. Older artifacts
+without this field use CHAT.
 
 For custom programs, set `programUri` to a trusted Python file. Its
 `build_program()` function, or the function named by `programFactory`, must return
@@ -43,10 +48,12 @@ No field named `question`, `contexts` or `answer` is imposed.
 ## Runner file paths
 
 Source files are supplied through `datasetUri`, `trainsetUri`, `validationUri`,
-`programUri` and `artifactUri`. Java loads and validates datasets, then passes their
-records and the runner paths through a stored configuration file. Dataset strings
-are preserved as data, not rendered as templates. Python does not read JSONL datasets
-or assume any dataset or artifact filename.
+`programUri` and `artifactUri`. Java copies and validates JSONL files without
+retaining their records, then passes metadata and runner paths through a stored
+configuration file. Dataset contents remain in the staged files and are never
+rendered as templates. Python preflights prediction fields and reads each row
+again for inference, without loading the whole prediction dataset. Optimize loads
+the bounded training and validation files into memory for DSPy.
 
 Use `filePaths` to override paths within the runner's working directory:
 
@@ -77,11 +84,25 @@ Use Kestra secrets through `env`, such as `OPENAI_API_KEY`.
 `DSPY_TEACHER_API_BASE` support distinct student and teacher connections.
 Credentials are not written into the plugin's artifact or manifest.
 
+Set `maxDatasetBytes` (default 67108864, or 64 MiB) and `maxDatasetRows` (default
+10000) to cap each dataset separately. Oversized files fail before model calls.
+ID tracking still uses memory proportional to the bounded row count.
+
 Set `maxLlmCalls`, `maxTokens`, `requestTimeoutSeconds` and the Kestra task
-`timeout` to bound execution. The call budget covers the plugin-supplied LMs,
+`timeout` to bound execution. `maxRetries` defaults to 2 additional attempts for
+rate limits, timeouts, transport errors and HTTP 500/502/503/504, with exponential
+backoff capped at 8 seconds. Set it to 0 to disable retries. Provider-internal
+retries remain disabled; every plugin retry consumes the same call budget.
+The budget applies per task attempt: a Kestra retry starts a new task budget.
+The call budget covers the plugin-supplied LMs,
 including copies used by BootstrapFewShot; arbitrary requests in user Python
 code are outside that budget. Errors fail the task rather than produce a zero
 score or an incomplete successful batch.
+
+Set `evaluate: true` on `Predict` to require consistent, non-empty references
+and return an `evaluationScore` using normalized exact match. Compare baseline
+and candidate scores on validation data before selecting a candidate. Keep the
+test set out of that decision.
 
 The default runner is Docker. Process requires Python and the locked dependencies
 on the worker. Other TaskRunners require an accessible compatible image and

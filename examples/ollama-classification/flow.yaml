@@ -1,0 +1,152 @@
+id: dspy_optimize_and_predict_local
+namespace: company.team
+
+inputs:
+  - id: train
+    type: FILE
+  - id: validation
+    type: FILE
+  - id: test
+    type: FILE
+  - id: minimum_validation_score
+    type: FLOAT
+    defaults: 0.8
+    min: 0
+    max: 1
+
+tasks:
+  - id: baseline
+    type: io.kestra.plugin.dspy.Predict
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: plugin-dspy:3.4.1
+    datasetUri: "{{ inputs.test }}"
+    evaluate: true
+    responseFormat: JSON
+    signature: "text -> category"
+    instructions: &classification_instructions |
+      Classify each customer message.
+      category must be exactly one of: billing, technical, other.
+      billing: invoices, payments, refunds.
+      technical: crashes, errors, bugs, login failures.
+      other: opening hours, general information.
+      Examples:
+      Send my invoice = billing
+      The app crashes = technical
+      What are your opening hours? = other
+      Choose the category based on the current text.
+    model: ollama_chat/llama3.2:1b
+    maxLlmCalls: 10
+    maxTokens: 512
+    requestTimeoutSeconds: 180
+    timeout: PT10M
+    env:
+      DSPY_STUDENT_API_BASE: http://host.docker.internal:11434
+
+  - id: baseline_validation
+    type: io.kestra.plugin.dspy.Predict
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: plugin-dspy:3.4.1
+    datasetUri: "{{ inputs.validation }}"
+    evaluate: true
+    responseFormat: JSON
+    signature: "text -> category"
+    instructions: *classification_instructions
+    model: ollama_chat/llama3.2:1b
+    maxLlmCalls: 10
+    maxTokens: 512
+    requestTimeoutSeconds: 180
+    timeout: PT10M
+    env:
+      DSPY_STUDENT_API_BASE: http://host.docker.internal:11434
+
+  - id: optimize
+    type: io.kestra.plugin.dspy.Optimize
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: plugin-dspy:3.4.1
+    trainsetUri: "{{ inputs.train }}"
+    validationUri: "{{ inputs.validation }}"
+    signature: "text -> category"
+    instructions: *classification_instructions
+    studentModel: ollama_chat/llama3.2:1b
+    teacherModel: ollama_chat/llama3.2:3b
+    responseFormat: JSON
+    optimizer: BOOTSTRAP_FEW_SHOT
+    maxBootstrappedDemos: 1
+    maxLabeledDemos: 6
+    metricThreshold: 1.0
+    seed: 42
+    maxLlmCalls: 30
+    maxTokens: 512
+    requestTimeoutSeconds: 180
+    timeout: PT20M
+    env:
+      DSPY_STUDENT_API_BASE: http://host.docker.internal:11434
+      DSPY_TEACHER_API_BASE: http://host.docker.internal:11434
+
+  - id: candidate_validation
+    type: io.kestra.plugin.dspy.Predict
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: plugin-dspy:3.4.1
+    artifactUri: "{{ outputs.optimize.candidateArtifactUri }}"
+    datasetUri: "{{ inputs.validation }}"
+    evaluate: true
+    maxLlmCalls: 10
+    maxTokens: 512
+    requestTimeoutSeconds: 180
+    timeout: PT10M
+    env:
+      DSPY_STUDENT_API_BASE: http://host.docker.internal:11434
+
+  # Promotion uses validation only, never the test score.
+  # Convert the FLOAT threshold through its decimal string before comparing doubles.
+  - id: select_candidate
+    type: io.kestra.plugin.core.flow.If
+    condition: >-
+      {{ outputs.candidate_validation.evaluationScore >= (inputs.minimum_validation_score | string | number('DOUBLE'))
+         and outputs.candidate_validation.evaluationScore >= outputs.baseline_validation.evaluationScore }}
+    then:
+      - id: optimized
+        type: io.kestra.plugin.dspy.Predict
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: plugin-dspy:3.4.1
+        artifactUri: "{{ outputs.optimize.candidateArtifactUri }}"
+        datasetUri: "{{ inputs.test }}"
+        evaluate: true
+        maxLlmCalls: 10
+        maxTokens: 512
+        requestTimeoutSeconds: 180
+        timeout: PT10M
+        env:
+          DSPY_STUDENT_API_BASE: http://host.docker.internal:11434
+    else:
+      - id: retain_baseline
+        type: io.kestra.plugin.core.log.Log
+        message: "Candidate rejected by validation; retaining the baseline predictions."
+
+outputs:
+  - id: baseline_predictions
+    type: STRING
+    value: "{{ outputs.baseline.predictionsUri }}"
+  - id: selected_predictions
+    type: STRING
+    value: "{{ outputs.select_candidate.evaluationResult ? outputs.optimized.predictionsUri : outputs.baseline.predictionsUri }}"
+  - id: validation_report
+    type: STRING
+    value: "{{ outputs.optimize.manifestUri }}"
+  - id: candidate_artifact
+    type: STRING
+    value: "{{ outputs.optimize.candidateArtifactUri }}"
+  - id: candidate_accepted
+    type: BOOL
+    value: "{{ outputs.select_candidate.evaluationResult }}"
+  - id: baseline_validation_score
+    type: FLOAT
+    value: "{{ outputs.baseline_validation.evaluationScore }}"
+  - id: candidate_validation_score
+    type: FLOAT
+    value: "{{ outputs.candidate_validation.evaluationScore }}"

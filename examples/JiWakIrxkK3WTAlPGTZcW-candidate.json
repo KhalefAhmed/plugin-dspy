@@ -1,0 +1,61 @@
+{
+  "artifactVersion": "02795b2e44721c64cd2044dfe012a06dc72029459ac0ac932e288720cac6adcb",
+  "dspyVersion": "3.4.1",
+  "program": {
+    "instructions": "classification_instructions",
+    "kind": "declarative",
+    "predictor": "PREDICT",
+    "signature": "text -> category"
+  },
+  "pythonVersion": "3.14.10",
+  "responseFormat": "JSON",
+  "schemaVersion": 1,
+  "state": {
+    "predictor": {
+      "demos": [
+        {
+          "augmented": true,
+          "category": "technical",
+          "text": "I get an error when resetting my password."
+        },
+        {
+          "category": "other",
+          "text": "Do you offer service on weekends?"
+        },
+        {
+          "category": "billing",
+          "text": "I was charged twice for my subscription."
+        },
+        {
+          "category": "other",
+          "text": "Where is your office located?"
+        },
+        {
+          "category": "technical",
+          "text": "The app freezes whenever I upload a photo."
+        },
+        {
+          "category": "billing",
+          "text": "Can you refund my last payment?"
+        }
+      ],
+      "lm": null,
+      "signature": {
+        "fields": [
+          {
+            "description": "${text}",
+            "prefix": "Text:"
+          },
+          {
+            "description": "${category}",
+            "prefix": "Category:"
+          }
+        ],
+        "instructions": "classification_instructions"
+      },
+      "traces": [],
+      "train": []
+    }
+  },
+  "studentModel": "ollama_chat/llama3.2:1b"
+}

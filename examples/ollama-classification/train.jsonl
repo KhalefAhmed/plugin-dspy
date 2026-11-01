@@ -1,0 +1,6 @@
+{"schemaVersion":1,"id":"train-1","inputs":{"text":"I was charged twice for my subscription."},"reference":{"category":"billing"}}
+{"schemaVersion":1,"id":"train-2","inputs":{"text":"Can you refund my last payment?"},"reference":{"category":"billing"}}
+{"schemaVersion":1,"id":"train-3","inputs":{"text":"The app freezes whenever I upload a photo."},"reference":{"category":"technical"}}
+{"schemaVersion":1,"id":"train-4","inputs":{"text":"I get an error when resetting my password."},"reference":{"category":"technical"}}
+{"schemaVersion":1,"id":"train-5","inputs":{"text":"Where is your office located?"},"reference":{"category":"other"}}
+{"schemaVersion":1,"id":"train-6","inputs":{"text":"Do you offer service on weekends?"},"reference":{"category":"other"}}

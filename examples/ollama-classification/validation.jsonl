@@ -1,0 +1,3 @@
+{"schemaVersion":1,"id":"validation-1","inputs":{"text":"The amount on my invoice is incorrect."},"reference":{"category":"billing"}}
+{"schemaVersion":1,"id":"validation-2","inputs":{"text":"The website shows an error when I sign in."},"reference":{"category":"technical"}}
+{"schemaVersion":1,"id":"validation-3","inputs":{"text":"How can I contact your sales team?"},"reference":{"category":"other"}}

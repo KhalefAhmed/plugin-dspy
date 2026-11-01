@@ -1,0 +1,42 @@
+{
+  "artifactSha256": "16b28e0e1dae00ec3f9a24300c988baf2a86d0e29963a87a137c1d3f36b1d3dc",
+  "artifactVersion": "ca2c326d8193931ab8e6709d4103cbf9159db32b4f8e662cd01ed0cbe7b19652",
+  "dependencyVersions": {
+    "dspy": "3.4.1",
+    "litellm": "1.106.6",
+    "openai": "2.54.0",
+    "pydantic": "2.14.2"
+  },
+  "dspyVersion": "3.4.1",
+  "maxBootstrappedDemos": 1,
+  "maxLabeledDemos": 6,
+  "maxLlmCalls": 30,
+  "maxTokens": 512,
+  "metricThreshold": 1.0,
+  "modelCalls": {
+    "ollama_chat/llama3.2:1b": 4
+  },
+  "optimizer": "BOOTSTRAP_FEW_SHOT",
+  "program": {
+    "instructions": "Classify each customer message.\ncategory must be exactly one of: billing, technical, other.\nbilling: invoices, payments, refunds.\ntechnical: crashes, errors, bugs, login failures.\nother: opening hours, general information.\nExamples:\nSend my invoice = billing\nThe app crashes = technical\nWhat are your opening hours? = other\nChoose the category based on the current text.\n",
+    "kind": "declarative",
+    "predictor": "PREDICT",
+    "signature": "text -> category"
+  },
+  "pythonVersion": "3.14.10",
+  "requestTimeoutSeconds": 180,
+  "schemaVersion": 1,
+  "seed": 42,
+  "studentModel": "ollama_chat/llama3.2:1b",
+  "teacherModel": "ollama_chat/llama3.2:1b",
+  "train": {
+    "count": 6,
+    "sha256": "b9956d1b511c6e33605b0af4f3593fdb5fbe7fc570bc05d1c075fbf90c656f54"
+  },
+  "validation": {
+    "count": 3,
+    "metric": "normalized_exact_match_v1",
+    "score": 0.6666666666666666,
+    "sha256": "e4d241ee571e7c45c3c3533b4645f6a8ba604fd22cfbbbedf045765a44eb9480"
+  }
+}

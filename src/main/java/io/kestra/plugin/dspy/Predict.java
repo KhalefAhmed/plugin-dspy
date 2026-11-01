@@ -1,14 +1,17 @@
 package io.kestra.plugin.dspy;
 
+import java.io.IOException;
 import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.kestra.core.models.annotations.Example;
 import io.kestra.core.models.annotations.Plugin;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.tasks.RunnableTask;
 import io.kestra.core.runners.RunContext;
+import io.kestra.core.serializers.JacksonMapper;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import jakarta.validation.constraints.NotNull;
@@ -47,6 +50,10 @@ import lombok.experimental.SuperBuilder;
         """)
 })
 public class Predict extends AbstractDspy implements RunnableTask<Predict.Output> {
+    public static final String MODEL = "model";
+    public static final String PREDICTIONS = "predictions";
+    public static final String ARTIFACT = "artifact";
+    public static final String SUMMARY = "summary";
     @Schema(title = "Optional URI of a JSON artifact produced by Optimize", description = "Without an artifact, provide signature or programUri and model. A custom artifact also requires its original programUri.")
     private Property<String> artifactUri;
 
@@ -57,16 +64,22 @@ public class Predict extends AbstractDspy implements RunnableTask<Predict.Output
     @Schema(title = "Provider/model identifier", description = "Required for direct prediction. With an artifact, defaults to its student model and can be overridden.")
     private Property<String> model;
 
+    @Builder.Default
+    @NotNull
+    @Schema(title = "Evaluate predictions against references", description = "Default: false. When true, every record must have the same non-empty reference fields. Returns a normalized exact-match evaluationScore in [0, 1].")
+    private Property<Boolean> evaluate = Property.ofValue(false);
+
     @Override
     public Output run(RunContext runContext) throws Exception {
         Map<String, Object> config = configuration(runContext);
         config.put("operation", "predict");
+        config.put("evaluate", runContext.render(evaluate).as(Boolean.class).orElseThrow());
         if (runContext.render(model).as(String.class).isPresent()) {
-            config.put("model", required(runContext, model, "model"));
+            config.put(MODEL, required(runContext, model, MODEL));
         }
-        Map<String, String> paths = filePaths(runContext, Map.of(
-            "program", "user_program.py", "dataset", "dataset.jsonl", "artifact", "artifact.json",
-            "predictions", "predictions.jsonl", "summary", "prediction-summary.json"
+        Map<String, String> paths = getfilePaths(runContext, Map.of(
+            "program", "user_program.py", "dataset", "dataset.jsonl", ARTIFACT, "artifact.json",
+            PREDICTIONS, "predictions.jsonl", SUMMARY, "prediction-summary.json"
         ));
         Map<String, String> files = programFiles(runContext, paths);
         files.put("dataset", uri(runContext, datasetUri, "datasetUri"));
@@ -74,21 +87,35 @@ public class Predict extends AbstractDspy implements RunnableTask<Predict.Output
             if (config.containsKey("signature") || config.containsKey("instructions")) {
                 throw new IllegalArgumentException("An artifact already defines its signature and instructions");
             }
-            files.put("artifact", uri(runContext, artifactUri, "artifactUri"));
+            files.put(ARTIFACT, uri(runContext, artifactUri, "artifactUri"));
         } else {
-            paths.remove("artifact");
+            paths.remove(ARTIFACT);
         }
-        if (!files.containsKey("artifact") && !config.containsKey("signature") && !files.containsKey("program")) {
+        if (!files.containsKey(ARTIFACT) && !config.containsKey("signature") && !files.containsKey("program")) {
             throw new IllegalArgumentException("Provide artifactUri, signature or programUri");
         }
-        if (!files.containsKey("artifact") && !config.containsKey("model")) {
+        if (!files.containsKey(ARTIFACT) && !config.containsKey(MODEL)) {
             throw new IllegalArgumentException("model is required for direct prediction");
         }
-        var result = execute(runContext, config, files, paths, List.of(paths.get("predictions"), paths.get("summary")));
+        var result = execute(runContext, config, files, paths, List.of(paths.get(PREDICTIONS), paths.get(SUMMARY)));
         return Output.builder()
-            .predictionsUri(outputUri(result, paths.get("predictions")))
-            .summaryUri(outputUri(result, paths.get("summary")))
+            .predictionsUri(outputUri(result, paths.get(PREDICTIONS)))
+            .summaryUri(outputUri(result, paths.get(SUMMARY)))
+            .evaluationScore(Boolean.TRUE.equals(config.get("evaluate"))
+                ? evaluationScore(runContext, outputUri(result, paths.get(SUMMARY))) : null)
             .build();
+    }
+
+    private double evaluationScore(RunContext context, URI summaryUri) throws IOException {
+        try (var stream = context.storage().getFile(summaryUri)) {
+            JsonNode summary = JacksonMapper.ofJson().readTree(stream);
+            JsonNode score = summary == null ? null : summary.get("evaluationScore");
+            if (score == null || !score.isNumber() || !Double.isFinite(score.doubleValue())
+                || score.doubleValue() < 0 || score.doubleValue() > 1) {
+                throw new IllegalStateException("DSPy did not produce a valid evaluationScore");
+            }
+            return score.doubleValue();
+        }
     }
 
     @Builder
@@ -98,5 +125,8 @@ public class Predict extends AbstractDspy implements RunnableTask<Predict.Output
         private final URI predictionsUri;
         @Schema(title = "Prediction summary URI", description = "Contains the artifact version, model, number of records and model calls.")
         private final URI summaryUri;
+
+        @Schema(title = "Evaluation score", description = "Normalized exact-match score in [0, 1], present only when evaluate is true.")
+        private final Double evaluationScore;
     }
 }

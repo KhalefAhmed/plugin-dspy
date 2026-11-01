@@ -1,0 +1,3 @@
+{"schemaVersion":1,"id":"test-1","inputs":{"text":"Please send me my invoice."},"reference":{"category":"billing"}}
+{"schemaVersion":1,"id":"test-2","inputs":{"text":"The application crashes when I log in."},"reference":{"category":"technical"}}
+{"schemaVersion":1,"id":"test-3","inputs":{"text":"What are your opening hours?"},"reference":{"category":"other"}}

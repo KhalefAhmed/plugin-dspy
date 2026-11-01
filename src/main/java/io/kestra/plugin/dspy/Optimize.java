@@ -61,6 +61,9 @@ import lombok.experimental.SuperBuilder;
 public class Optimize extends AbstractDspy implements RunnableTask<Optimize.Output> {
 
     public static final String METRIC_FUNCTION = "metricFunction";
+    public static final String PROGRAM = "program";
+    public static final String RESULT = "result";
+    public static final String CANDIDATE = "candidate";
 
     public enum Optimizer {
         BOOTSTRAP_FEW_SHOT
@@ -128,24 +131,24 @@ public class Optimize extends AbstractDspy implements RunnableTask<Optimize.Outp
             throw new IllegalArgumentException("metricThreshold must be in (0, 1]");
         }
         config.put("metricThreshold", threshold);
-        Map<String, String> paths = filePaths(runContext, Map.of(
-            "program", "user_program.py", "train", "train.jsonl", "validation", "validation.jsonl",
-            "candidate", "candidate.json", "result", "optimization-result.json"
+        Map<String, String> paths = getfilePaths(runContext, Map.of(
+            PROGRAM, "user_program.py", "train", "train.jsonl", "validation", "validation.jsonl",
+            CANDIDATE, "candidate.json", RESULT, "optimization-result.json"
         ));
         Map<String, String> files = programFiles(runContext, paths);
-        if (!config.containsKey("signature") && !files.containsKey("program")) {
+        if (!config.containsKey("signature") && !files.containsKey(PROGRAM)) {
             throw new IllegalArgumentException("Provide signature or programUri");
         }
-        if (config.containsKey(METRIC_FUNCTION) && !files.containsKey("program")) {
+        if (config.containsKey(METRIC_FUNCTION) && !files.containsKey(PROGRAM)) {
             throw new IllegalArgumentException("metricFunction requires programUri");
         }
         files.put("train", uri(runContext, trainsetUri, "trainsetUri"));
         files.put("validation", uri(runContext, validationUri, "validationUri"));
-        var result = execute(runContext, config, files, paths, List.of(paths.get("candidate"), paths.get("result")));
-        URI candidateUri = outputUri(result, paths.get("candidate"));
+        var result = execute(runContext, config, files, paths, List.of(paths.get(CANDIDATE), paths.get(RESULT)));
+        URI candidateUri = outputUri(result, paths.get(CANDIDATE));
         return Output.builder()
             .candidateArtifactUri(candidateUri)
-            .manifestUri(DspyManifest.write(runContext, config, candidateUri, outputUri(result, paths.get("result"))))
+            .manifestUri(DspyManifest.write(runContext, config, candidateUri, outputUri(result, paths.get(RESULT))))
             .build();
     }
 

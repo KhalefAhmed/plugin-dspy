@@ -39,6 +39,11 @@ public abstract class AbstractDspy extends AbstractExecScript {
         CHAIN_OF_THOUGHT
     }
 
+    public enum ResponseFormat {
+        CHAT,
+        JSON
+    }
+
     @Schema(title = "Declarative DSPy signature", description = "For example `text -> category` or `question, contexts -> answer`. Mutually exclusive with programUri. Predict can instead load the definition from an artifact.")
     protected Property<String> signature;
 
@@ -49,6 +54,9 @@ public abstract class AbstractDspy extends AbstractExecScript {
     @Builder.Default
     @NotNull
     protected Property<Predictor> predictor = Property.ofValue(Predictor.PREDICT);
+
+    @Schema(title = "DSPy response format", description = "CHAT uses DSPy field markers; JSON uses JSONAdapter and provider structured output when supported. Defaults to CHAT for a new program, or the saved artifact's format when reloading. No automatic adapter retry.")
+    protected Property<ResponseFormat> responseFormat;
 
     @Schema(title = "URI of a custom Python program", description = "The file must expose programFactory returning a dspy.Module. Custom artifacts require the same source file during prediction. Only run trusted code.")
     protected Property<String> programUri;
@@ -82,10 +90,25 @@ public abstract class AbstractDspy extends AbstractExecScript {
     @NotNull
     protected Property<String> pythonExecutable = Property.ofValue("python3");
 
-    @Schema(title = "Maximum model calls across the task", description = "Includes teacher and validation calls. Provider retries, response caches and adapter fallbacks are disabled.")
+    @Schema(title = "Maximum model calls across the task attempt", description = "Includes teacher, validation and retry attempts. Provider-internal retries, response caches and adapter fallbacks are disabled.")
     @Builder.Default
     @NotNull
     protected Property<Integer> maxLlmCalls = Property.ofValue(100);
+
+    @Schema(title = "Maximum dataset size in bytes", description = "Applies separately to prediction, training and validation files. Enforced while downloading, before model calls. Default: 64 MiB.")
+    @Builder.Default
+    @NotNull
+    protected Property<Long> maxDatasetBytes = Property.ofValue(DspyDataset.DEFAULT_MAX_BYTES);
+
+    @Schema(title = "Maximum dataset rows", description = "Applies separately to prediction, training and validation files. Java validates rows without retaining their contents. Default: 10000.")
+    @Builder.Default
+    @NotNull
+    protected Property<Integer> maxDatasetRows = Property.ofValue(DspyDataset.DEFAULT_MAX_ROWS);
+
+    @Schema(title = "Maximum additional model-request retries", description = "Default: 2. Only transient failures are retried with bounded exponential backoff. Every attempt consumes maxLlmCalls. Set 0 to disable retries.")
+    @Builder.Default
+    @NotNull
+    protected Property<Integer> maxRetries = Property.ofValue(2);
 
     @Schema(title = "Timeout per model request, in seconds")
     @Builder.Default
@@ -101,11 +124,29 @@ public abstract class AbstractDspy extends AbstractExecScript {
         Map<String, Object> configuration = new LinkedHashMap<>();
         configuration.put("schemaVersion", 1);
         configuration.put("maxLlmCalls", positive(runContext, maxLlmCalls, "maxLlmCalls"));
+        configuration.put("maxDatasetRows", positive(runContext, maxDatasetRows, "maxDatasetRows"));
+        long byteLimit = runContext.render(maxDatasetBytes).as(Long.class).orElseThrow(
+            () -> new IllegalArgumentException("maxDatasetBytes is required")
+        );
+        if (byteLimit <= 0) {
+            throw new IllegalArgumentException("maxDatasetBytes must be positive");
+        }
+        configuration.put("maxDatasetBytes", byteLimit);
+        int retries = runContext.render(maxRetries).as(Integer.class).orElseThrow(
+            () -> new IllegalArgumentException("maxRetries is required")
+        );
+        if (retries < 0) {
+            throw new IllegalArgumentException("maxRetries must not be negative");
+        }
+        configuration.put("maxRetries", retries);
         configuration.put("requestTimeoutSeconds", positive(runContext, requestTimeoutSeconds, "requestTimeoutSeconds"));
         configuration.put("maxTokens", positive(runContext, maxTokens, "maxTokens"));
         runContext.render(signature).as(String.class).ifPresent(value -> configuration.put("signature", value));
         runContext.render(instructions).as(String.class).ifPresent(value -> configuration.put("instructions", value));
         configuration.put("predictor", runContext.render(predictor).as(Predictor.class).orElseThrow().name());
+        runContext.render(responseFormat).as(ResponseFormat.class).ifPresent(
+            format -> configuration.put("responseFormat", format.name())
+        );
         configuration.put("programFactory", required(runContext, programFactory, "programFactory"));
         return configuration;
     }
@@ -123,7 +164,7 @@ public abstract class AbstractDspy extends AbstractExecScript {
         return files;
     }
 
-    protected Map<String, String> filePaths(RunContext context, Map<String, String> defaults) throws IllegalVariableEvaluationException {
+    protected Map<String, String> getfilePaths(RunContext context, Map<String, String> defaults) throws IllegalVariableEvaluationException {
         Map<String, String> paths = new LinkedHashMap<>(defaults);
         Map<String, String> overrides = context.render(filePaths).asMap(String.class, String.class);
         for (var entry : overrides.entrySet()) {

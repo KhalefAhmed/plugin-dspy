@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import random
 import sys
+import threading
 import time
 import unicodedata
 
@@ -27,6 +28,14 @@ class ContractError(ValueError):
 
 class BudgetExceeded(RuntimeError):
     pass
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, error, retryable):
+        status = error.status
+        detail = f" (HTTP {status})" if type(status) is int else ""
+        reason = "transient failure; retries exhausted" if retryable else "non-retryable failure"
+        super().__init__(f"LLM request failed: {type(error).__name__}{detail}; {reason}. Provider payload redacted.")
 
 
 class DeclarativeProgram(dspy.Module):
@@ -48,20 +57,39 @@ class Budget:
     def __init__(self, limit):
         self.limit = limit
         self.counts = {}
+        self.lock = threading.Lock()
 
     def consume(self, model):
-        if sum(self.counts.values()) >= self.limit:
-            raise BudgetExceeded("Maximum model-call budget exceeded")
-        self.counts[model] = self.counts.get(model, 0) + 1
+        with self.lock:
+            if sum(self.counts.values()) >= self.limit:
+                raise BudgetExceeded("Maximum model-call budget exceeded")
+            self.counts[model] = self.counts.get(model, 0) + 1
 
 
 class BudgetLM(dspy.LM):
     # One task per process: copies made by BootstrapFewShot share this budget.
     budget = None
 
+    def __init__(self, *args, max_retries=2, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._max_retries = max_retries
+
     def __call__(self, *args, **kwargs):
-        self.budget.consume(self.model)
-        return super().__call__(*args, **kwargs)
+        for attempt in range(self._max_retries + 1):
+            self.budget.consume(self.model)
+            try:
+                return super().__call__(*args, **kwargs)
+            except dspy.LMError as error:
+                retryable = isinstance(error, (dspy.LMRateLimitError, dspy.LMTimeoutError, dspy.LMTransportError))
+                retryable = retryable or error.status in (500, 502, 503, 504)
+                if not retryable or attempt == self._max_retries:
+                    raise ProviderError(error, retryable) from None
+                print(
+                    f"Transient LLM failure ({type(error).__name__}); retry {attempt + 1}/{self._max_retries}.",
+                    file=sys.stderr,
+                )
+                time.sleep(min(2 ** attempt, 8))
+        raise ContractError("maxRetries must not be negative")
 
 
 def canonical(value):
@@ -108,6 +136,20 @@ def examples(records):
         dspy.Example(**row["inputs"], **row.get("reference", {})).with_inputs(*row["inputs"])
         for row in records
     ]
+
+
+def read_dataset(path):
+    count = 0
+    with Path(path).open(encoding="utf-8") as source:
+        for line_number, line in enumerate(source, 1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                raise ContractError(f"Invalid dataset JSON at line {line_number}") from None
+            count += 1
+            yield row
+    if count == 0:
+        raise ContractError("Dataset must not be empty")
 
 
 def load_user_module(path):
@@ -165,19 +207,16 @@ def make_metric(config, module):
 
 
 def validate_fields(records, descriptor):
+    signature = dspy.Signature(descriptor["signature"]) if descriptor["kind"] == "declarative" else None
     for row in records:
         fields = row["inputs"] | row.get("reference", {})
         if any(not key.isidentifier() or key.startswith("_") for key in fields):
             raise ContractError("Dataset field names must be public Python identifiers")
-    if descriptor["kind"] != "declarative":
-        return
-    signature = dspy.Signature(descriptor["signature"])
-    inputs = set(signature.input_fields)
-    outputs = set(signature.output_fields)
-    for row in records:
-        if set(row["inputs"]) != inputs:
+        if signature is None:
+            continue
+        if set(row["inputs"]) != set(signature.input_fields):
             raise ContractError("Dataset inputs must match the declared signature fields")
-        if row.get("reference") and set(row["reference"]) != outputs:
+        if row.get("reference") and set(row["reference"]) != set(signature.output_fields):
             raise ContractError("Dataset references must match the declared signature output fields")
 
 
@@ -193,14 +232,22 @@ def make_lm(model, role, config):
         value = os.environ.get(f"DSPY_{role}_{suffix}")
         if value:
             options[option] = value
-    return BudgetLM(text(model, f"{role} model"), **options)
+    return BudgetLM(text(model, f"{role} model"), max_retries=config["maxRetries"], **options)
+
+
+def make_adapter(response_format):
+    if response_format == "CHAT":
+        return dspy.ChatAdapter(use_json_adapter_fallback=False)
+    if response_format == "JSON":
+        return dspy.JSONAdapter()
+    raise ContractError("Unsupported responseFormat; expected CHAT or JSON")
 
 
 def artifact_version(artifact):
     return hashlib.sha256(canonical({key: value for key, value in artifact.items() if key != "artifactVersion"})).hexdigest()
 
 
-def make_artifact(program: dspy.Module, descriptor, model):
+def make_artifact(program: dspy.Module, descriptor, model, response_format="CHAT"):
     program.set_lm(None)
     artifact = {
         "schemaVersion": SCHEMA_VERSION,
@@ -208,6 +255,7 @@ def make_artifact(program: dspy.Module, descriptor, model):
         "dspyVersion": DSPY_VERSION,
         "pythonVersion": platform.python_version(),
         "studentModel": model,
+        "responseFormat": response_format,
         "state": program.dump_state(),
     }
     artifact["artifactVersion"] = artifact_version(artifact)
@@ -226,8 +274,8 @@ def validate_state(state):
 
 def optimize(config):
     files = config["files"]
-    train = config["datasets"]["train"]
-    validation = config["datasets"]["validation"]
+    train = list(read_dataset(files["train"]))
+    validation = list(read_dataset(files["validation"]))
     descriptor = config["program"]
     validate_fields(train + validation, descriptor)
     module = load_user_module(files.get("program"))
@@ -241,6 +289,7 @@ def optimize(config):
     student.set_lm(student_lm)
     teacher = build_program(descriptor, module)
     teacher.set_lm(teacher_lm)
+    response_format = config.get("responseFormat", "CHAT")
     optimizer = dspy.BootstrapFewShot(
         metric=metric,
         metric_threshold=config["metricThreshold"],
@@ -250,14 +299,14 @@ def optimize(config):
         max_rounds=1,
         max_errors=1,
     )
-    with dspy.context(lm=student_lm):
+    with dspy.context(lm=student_lm, adapter=make_adapter(response_format)):
         candidate = optimizer.compile(student, teacher=teacher, trainset=examples(train))
         candidate.set_lm(student_lm)
         scores = [
             metric(example, candidate(**example.inputs()))
             for example in examples(validation)
         ]
-    artifact = make_artifact(candidate, descriptor, config["studentModel"])
+    artifact = make_artifact(candidate, descriptor, config["studentModel"], response_format)
     validate_state(artifact["state"])
     result = {
         "pythonVersion": platform.python_version(),
@@ -275,7 +324,6 @@ def optimize(config):
 
 def predict(config):
     files = config["files"]
-    records = config["datasets"]["dataset"]
     module = load_user_module(files.get("program"))
     if files.get("artifact") is not None:
         artifact = json.loads(Path(files["artifact"]).read_text(encoding="utf-8"))
@@ -289,21 +337,29 @@ def predict(config):
         program = build_program(descriptor, module)
         program.load_state(artifact["state"])
         model = text(config.get("model", artifact.get("studentModel")), "Student model")
+        response_format = config.get("responseFormat", artifact.get("responseFormat", "CHAT"))
     else:
         descriptor = config["program"]
         program = build_program(descriptor, module)
         model = text(config.get("model"), "Student model")
-        artifact = make_artifact(program, descriptor, model)
-    validate_fields(records, descriptor)
+        response_format = config.get("responseFormat", "CHAT")
+        artifact = make_artifact(program, descriptor, model, response_format)
+    # Preflight all rows before any billable request, without retaining the dataset.
+    validate_fields(read_dataset(files["dataset"]), descriptor)
+    metric = make_metric(config, None) if config.get("evaluate") else None
     lm = make_lm(model, "STUDENT", config)
     program.set_lm(lm)
     started = time.monotonic()
     target_path = Path(files["predictions"])
     target_path.parent.mkdir(parents=True, exist_ok=True)
     partial = target_path.with_name(target_path.name + ".partial")
-    with dspy.context(lm=lm), partial.open("wb") as target:
-        for row in records:
+    count = 0
+    score = 0.0
+    with dspy.context(lm=lm, adapter=make_adapter(response_format), trace=None), partial.open("wb") as target:
+        for row in read_dataset(files["dataset"]):
             prediction = program(**row["inputs"])
+            if metric is not None:
+                score += metric(dspy.Example(**row["inputs"], **row["reference"]), prediction)
             target.write(canonical({
                 "schemaVersion": SCHEMA_VERSION,
                 "id": row["id"],
@@ -311,19 +367,24 @@ def predict(config):
                 "outputs": prediction_outputs(prediction),
                 "artifactVersion": artifact["artifactVersion"],
             }) + b"\n")
+            count += 1
     partial.replace(target_path)
-    write_json(files["summary"], {
+    summary = {
         "schemaVersion": SCHEMA_VERSION,
         "artifactVersion": artifact["artifactVersion"],
         "model": model,
-        "count": len(records),
+        "responseFormat": response_format,
+        "count": count,
         "durationSeconds": time.monotonic() - started,
         "modelCalls": dict(BudgetLM.budget.counts),
-    })
+    }
+    if metric is not None:
+        summary["evaluationScore"] = score / count
+    write_json(files["summary"], summary)
 
 
 def report_error(error_type, error, _traceback):
-    if isinstance(error, (ContractError, BudgetExceeded)):
+    if isinstance(error, (ContractError, BudgetExceeded, ProviderError)):
         print(f"{error_type.__name__}: {error}", file=sys.stderr)
     else:
         print(f"DSPy execution failed ({error_type.__name__}). Provider details and program data are redacted.", file=sys.stderr)
@@ -334,7 +395,7 @@ def main(path):
         raise ContractError(f"This plugin requires dspy=={DSPY_VERSION}")
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     BudgetLM.budget = Budget(config["maxLlmCalls"])
-    dspy.configure(adapter=dspy.ChatAdapter(use_json_adapter_fallback=False), disable_history=True)
+    dspy.configure(adapter=make_adapter(config.get("responseFormat", "CHAT")), disable_history=True)
     logging.getLogger("dspy").setLevel(logging.ERROR)
     for name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
         logging.getLogger(name).disabled = True
