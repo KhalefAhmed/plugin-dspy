@@ -2,26 +2,17 @@ id: dspy_predict_iceberg_batches
 namespace: company.team
 description: |
   Read an Iceberg table through Athena, split the results into bounded batches,
-  run the same declarative DSPy program on each batch, and upload predictions to S3.
-
-# Requires Kestra 2.0.7+, the AWS, Serdes and Python Script plugins, the DSPy JAR,
-# and the plugin-dspy:3.4.1 image on the worker's Docker daemon.
-# Secrets: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, OPENAI_API_KEY.
-# Athena's default workgroup must support Iceberg (engine version 3).
-# AWS credentials need Athena query access, Glue catalog access, read access to
-# the Iceberg table's S3 objects, and read/write access to query results and outputs.
-# The query must return unique, non-blank string ids and an inputs_json VARCHAR.
-# Example query for a signature "source -> result":
-# SELECT CAST(id AS VARCHAR) AS id,
-#        json_format(CAST(MAP(ARRAY['source'], ARRAY[source]) AS JSON)) AS inputs_json
-# FROM documents FOR VERSION AS OF 123456789;
-# Replace the table, fields and snapshot id with your own values.
-# Results stay in separate S3 files; this flow does not write an Iceberg table.
+  run the same declarative DSPy program with Claude Opus on Amazon Bedrock
+  on each batch, and upload predictions to S3.
 
 inputs:
   - id: aws_region
     type: STRING
     defaults: eu-west-1
+  - id: bedrock_region
+    type: STRING
+    defaults: eu-west-2
+    description: "Bedrock Mantle region with access to Claude Opus; independent of Athena and S3."
   - id: athena_database
     type: STRING
   - id: select_query
@@ -51,7 +42,8 @@ inputs:
     description: "Instructions for your declarative DSPy program."
   - id: model
     type: STRING
-    defaults: openai/gpt-4.1-mini
+    defaults: bedrock_mantle/anthropic.claude-opus-5-5
+    description: "LiteLLM Bedrock Mantle model identifier; use the bare model ID without an inference-profile prefix."
 
 tasks:
   - id: read_iceberg
@@ -139,7 +131,9 @@ tasks:
             maxLlmCalls: "{{ inputs.batch_size }}"
             timeout: PT2H
             env:
-              OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
+              AWS_ACCESS_KEY_ID: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+              AWS_SECRET_ACCESS_KEY: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+              AWS_REGION_NAME: "{{ inputs.bedrock_region }}"
 
           - id: upload_predictions
             type: io.kestra.plugin.aws.s3.Upload
