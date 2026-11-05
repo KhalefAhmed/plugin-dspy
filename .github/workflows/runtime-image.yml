@@ -22,7 +22,7 @@ jobs:
         run: bash .github/setup-unit.sh
       - name: Check Java, Docker integration and plugin packaging
         run: ./gradlew test lintPluginDocs shadowJar
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: plugin-jar
           path: build/libs/*.jar
